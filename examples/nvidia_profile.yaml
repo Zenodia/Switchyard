@@ -1,0 +1,85 @@
+# Switchyard profile config for NVIDIA build.nvidia.com endpoints.
+#
+#   switchyard serve --config examples/nvidia_profile.yaml
+#
+# Two OpenAI-compatible endpoints, each with its own credential:
+#   integrate  -> https://integrate.api.nvidia.com/v1  (env: NVIDIA_API_KEY)
+#   inference  -> https://inference-api.nvidia.com/v1   (env: INFERENCE_API_KEY)
+#
+# NOTE: base_url ends at /v1 — Switchyard appends /chat/completions itself.
+# Every profile id and target id below is exposed as a selectable model on
+# GET /v1/models, so a client picks a model by id.
+
+endpoints:
+  integrate:
+    base_url: https://integrate.api.nvidia.com/v1
+    api_key: ${NVIDIA_API_KEY}
+  inference:
+    base_url: https://inference-api.nvidia.com/v1
+    api_key: ${INFERENCE_API_KEY}
+
+targets:
+  # --- integrate.api.nvidia.com (NVIDIA_API_KEY) ---
+  nemotron-ultra:
+    endpoint: integrate
+    model: nvidia/nemotron-3-ultra-550b-a55b
+    format: openai
+    extra_body:
+      chat_template_kwargs: { enable_thinking: true }
+      reasoning_budget: 16384
+  nemotron-nano:
+    endpoint: integrate
+    model: nvidia/nvidia-nemotron-nano-9b-v2
+    format: openai
+  glm:
+    endpoint: integrate
+    model: meta/llama-3.2-1b-instruct
+    format: openai
+
+  # --- inference-api.nvidia.com (INFERENCE_API_KEY) ---
+  bedrock-claude-sonnet:
+    endpoint: inference
+    model: aws/anthropic/bedrock-claude-sonnet-5
+    format: openai
+  nemotron-nano-30b:
+    endpoint: inference
+    model: nvidia/nvidia/Nemotron-3-Nano-30B-A3B
+    format: openai
+  deepseek-v4-flash:
+    endpoint: inference
+    model: nvidia/deepseek-ai/deepseek-v4-flash
+    format: openai
+    # V4 chain-of-thought default blows past the Hub gateway timeout;
+    # disable thinking to keep response times flat.
+    extra_body:
+      chat_template_kwargs: { enable_thinking: false }
+  gpt-4o-mini:
+    endpoint: inference
+    model: azure/openai/gpt-4o-mini
+    format: openai
+
+profiles:
+  # integrate.api models
+  ultra:
+    type: passthrough
+    target: nemotron-ultra
+  nano:
+    type: passthrough
+    target: nemotron-nano
+  glm-profile:
+    type: passthrough
+    target: glm
+
+  # inference-api models
+  sonnet:
+    type: passthrough
+    target: bedrock-claude-sonnet
+  nano-30b:
+    type: passthrough
+    target: nemotron-nano-30b
+  deepseek:
+    type: passthrough
+    target: deepseek-v4-flash
+  gpt-4o-mini-profile:
+    type: passthrough
+    target: gpt-4o-mini
