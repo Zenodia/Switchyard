@@ -8,15 +8,18 @@ use std::sync::Arc;
 
 use serde_json::Value;
 
+use crate::LlmResponseStreamEvent;
+use crate::codecs::FormatCodec;
 use crate::codecs::anthropic::AnthropicMessagesCodec;
 use crate::codecs::openai_chat::OpenAiChatCodec;
 use crate::codecs::responses::OpenAiResponsesCodec;
-use crate::codecs::stream::{StreamCodecRegistry, StreamTranslationState};
-use crate::codecs::FormatCodec;
+use crate::codecs::stream::{
+    StreamCodecRegistry, StreamTranslationState, encode_response_stream_event,
+};
 use crate::diagnostic::TranslationDiagnostic;
 use crate::error::{Result, TranslationError};
 use crate::format::FormatId;
-use crate::ir::{ConversationRequest, ConversationResponse};
+use crate::llm::{AggLlmResponse, LlmRequest, ProviderExtensions};
 use crate::policy::TranslationPolicy;
 
 /// Encoded translation result with any diagnostics emitted along the way.
@@ -29,14 +32,14 @@ pub struct TranslationOutput {
 /// Decoded request IR plus diagnostics.
 #[derive(Debug)]
 pub struct RequestIrOutput {
-    pub request: ConversationRequest,
+    pub request: LlmRequest,
     pub diagnostics: Vec<TranslationDiagnostic>,
 }
 
 /// Decoded response IR plus diagnostics.
 #[derive(Debug)]
 pub struct ResponseIrOutput {
-    pub response: ConversationResponse,
+    pub response: AggLlmResponse,
     pub diagnostics: Vec<TranslationDiagnostic>,
 }
 
@@ -127,7 +130,7 @@ impl TranslationEngine {
     pub fn encode_request(
         &self,
         target: impl Into<FormatId>,
-        request: &ConversationRequest,
+        request: &LlmRequest,
         policy: &TranslationPolicy,
     ) -> Result<TranslationOutput> {
         let target = target.into();
@@ -184,7 +187,7 @@ impl TranslationEngine {
     pub fn encode_response(
         &self,
         target: impl Into<FormatId>,
-        response: &ConversationResponse,
+        response: &AggLlmResponse,
         policy: &TranslationPolicy,
     ) -> Result<TranslationOutput> {
         let target = target.into();
@@ -196,6 +199,29 @@ impl TranslationEngine {
             body: encoded.body,
             diagnostics: encoded.diagnostics,
         })
+    }
+
+    /// Encodes a neutral response IR while applying metadata retained from its request.
+    ///
+    /// Request extensions are used to restore caller-specific response details, such as
+    /// Codex tool namespaces, without exposing those details to the upstream provider.
+    pub fn encode_response_with_extensions(
+        &self,
+        target: impl Into<FormatId>,
+        response: &AggLlmResponse,
+        request_extensions: &ProviderExtensions,
+        policy: &TranslationPolicy,
+    ) -> Result<TranslationOutput> {
+        let mut output = self.encode_response(target, response, policy)?;
+        crate::codex_namespaces::restore_qualified_tool_names(
+            &mut output.body,
+            &crate::codex_namespaces::qualified_tool_origins(request_extensions),
+        );
+        crate::codex_custom_tools::restore_custom_tool_calls(
+            &mut output.body,
+            &crate::codex_custom_tools::custom_tool_names(request_extensions),
+        );
+        Ok(output)
     }
 
     /// Translates a response body from source format to target format.
@@ -234,6 +260,16 @@ impl TranslationEngine {
         let target = target.into();
         let source_codec = self.stream_registry.codec(source.clone())?;
         let target_codec = self.stream_registry.codec(target.clone())?;
+        if let Err(error) =
+            crate::codecs::responses::validate_stream_output(&source, &target, event)
+        {
+            return Ok(target_codec.encode_event(
+                state,
+                crate::LlmResponseChunk::DecodeError {
+                    message: error.to_string(),
+                },
+            ));
+        }
         let canonical = source_codec.decode_event(state, event);
         state.source = Some(source);
         state.target = Some(target);
@@ -241,6 +277,45 @@ impl TranslationEngine {
             .into_iter()
             .flat_map(|event| target_codec.encode_event(state, event))
             .collect())
+    }
+
+    /// Decodes one provider event while retaining its parsed source JSON value.
+    ///
+    /// Takes ownership of `event` so preservation does not deep-copy provider JSON
+    /// on the per-event streaming path.
+    pub fn decode_stream_event(
+        &self,
+        state: &mut StreamTranslationState,
+        source: impl Into<FormatId>,
+        event: Value,
+    ) -> Result<LlmResponseStreamEvent> {
+        let source = source.into();
+        let source_codec = self.stream_registry.codec(source.clone())?;
+        state.source = Some(source.clone());
+        let normalized = source_codec.decode_event(state, &event);
+        Ok(LlmResponseStreamEvent::preserved(source, event, normalized))
+    }
+
+    /// Encodes one neutral or preserved stream event for a target provider.
+    ///
+    /// A preserved event replays its retained JSON value unchanged when its
+    /// source and target formats match. Cross-format encoding intentionally
+    /// uses only its normalized events.
+    pub fn encode_stream_event(
+        &self,
+        state: &mut StreamTranslationState,
+        target: impl Into<FormatId>,
+        event: LlmResponseStreamEvent,
+    ) -> Result<Vec<Value>> {
+        let target = target.into();
+        let target_codec = self.stream_registry.codec(target.clone())?;
+        state.target = Some(target.clone());
+        Ok(encode_response_stream_event(
+            state,
+            target_codec.as_ref(),
+            &target,
+            event,
+        ))
     }
 
     /// Finishes target-provider stream emission after the source stream closes.

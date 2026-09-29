@@ -1,103 +1,112 @@
 # Core Concepts
 
-This page explains the vocabulary the rest of the documentation takes for
-granted. Read it once and the configuration examples elsewhere will make sense.
-It is not a setup guide: to install and run Switchyard, see
-[Getting Started](getting_started.md), and to follow a request through the
-system, see [Architecture](architecture.md).
+Switchyard routes LLM requests through provider-neutral Rust types and exposes
+the result through OpenAI- and Anthropic-compatible APIs. For setup, see
+[Getting Started](getting_started.md). For the complete request lifecycle, see
+[Architecture](architecture.md).
 
-## How it fits together
+## Runtime Surfaces
 
-Switchyard is a proxy. Clients (coding agents, SDKs, your own services) talk to
-it on one side, and model backends (hosted providers, private endpoints, local
-models) sit on the other. A client never asks for a backend by name. It sends a
-model ID, and the configuration behind that ID decides what actually runs.
+Switchyard exposes the same Rust routing core through two runtime surfaces:
+
+- **`switchyard-server`** is the standalone HTTP proxy. It loads a native TOML
+  deployment and exposes OpenAI Chat Completions, OpenAI Responses, and
+  Anthropic Messages endpoints.
+- **`switchyard-libsy`** is the embeddable Rust library. Applications construct
+  targets and algorithms directly and can let libsy make calls or fulfill its
+  requested model calls themselves.
+
+## Request Flow
+
+The standalone server translates an inbound provider format into the shared
+protocol types before routing. The selected target's LLM client translates the
+request into its upstream format, makes the call, and translates the response
+back to the client's format.
 
 ```mermaid
 flowchart LR
-    client["Client<br/>picks a model ID"]
-    profile["Profile<br/>routing policy"]
+    client["Client<br/>OpenAI or Anthropic API"]
+    request["Decode request<br/>provider-neutral types"]
+    route["Route<br/>algorithm decision"]
     target["Target<br/>upstream model"]
-    endpoint["Endpoint<br/>provider connection"]
-    backend["Model backend"]
+    upstream["Encode request<br/>upstream format"]
+    backend["LLM backend"]
+    response["Decode and translate<br/>response or stream"]
 
-    client -->|"model field"| profile
-    profile -->|"selects"| target
-    target -->|"uses"| endpoint
-    endpoint --> backend
+    client --> request --> route --> target --> upstream --> backend
+    backend --> response --> client
 ```
 
-## Endpoints, targets, and profiles
+## LLM Clients, Targets, and Routes
 
-A standalone deployment is described by a profile config: one file with three
-sections that keep provider connectivity, upstream models, and client-facing
-policy apart. Three terms carry most of the weight.
+A native TOML deployment has three layers:
 
-| Term | What it is | YAML section |
-|---|---|---|
-| Endpoint | A provider connection: a `base_url` and its credentials. Many targets can share one. | `endpoints:` |
-| Target | A single upstream model you can call. It names an endpoint, a `model`, and a wire `format`. | `targets:` |
-| Profile | A client-facing routing policy over one or more targets. Its `type` is the routing strategy. | `profiles:` |
+| Layer | Defines |
+|---|---|
+| **LLM client** | Upstream base URL, wire format, credential environment variable, and retry policy. |
+| **Target** | One upstream model ID and the LLM client used to call it. |
+| **Route** | One client-visible model ID and the algorithm that selects or calls targets. |
 
-The three nest. An endpoint is reused by targets, and targets are referenced by
-profiles. You set credentials in one place, add a model once, and build as many
-policies on top as you need. The [Routing Overview](routing_algorithms/overview.md)
-has a complete, runnable config and the full schema.
+These layers keep provider transport separate from routing policy. Several
+targets can share one LLM client, and several routes can reuse the same target.
+Secrets stay outside the TOML: `api_key_env` names the environment variable the
+server reads at startup.
 
 ## Model IDs
 
-Clients choose what happens through the `model` field on a request. Switchyard
-registers three kinds of model IDs and lists them all on `GET /v1/models`:
-profile IDs, which apply a routing policy; target IDs, which skip routing and
-call that one model; and the upstream model name itself, registered as an alias
-whenever it differs from its target ID. Send a profile ID when you want routing,
-or a target or upstream name when you want to pin a single model.
+The table keys in `llm_clients`, `targets`, and `routes` are local references
+inside the TOML file. Their `id` fields have different external meanings:
 
-## Tiers and routing strategies
+- A target's `id` is the model ID sent to its upstream provider.
+- A route's `id` is the model ID clients send to Switchyard.
 
-Most routing strategies divide traffic between two tiers: a strong target that
-is more capable and more expensive, and a weak target that is cheaper and
-faster. A tier is a role you hand to a target rather than a fixed property of it,
-so the same target can be the strong tier in one profile and the weak tier in
-another.
+The server lists route IDs on `GET /v1/models`. A request selects a route by
+putting that ID in its `model` field. The native Rust server does not discover
+or register additional provider models automatically. Each entry reports the route's
+declared `context_window` as its top-level `context_length` field (see
+[model discovery](../crates/switchyard-server/README.md#model-discovery)). The
+response includes an empty Codex `models` array so Codex keeps its own catalog and instructions. Select route
+aliases explicitly; they do not appear automatically in Codex's model picker.
 
-A profile's `type` sets the strategy. `passthrough` sends everything to one
-target with no routing. `random-routing` splits traffic on a fixed probability.
-`llm-routing` asks a classifier model to pick a tier for each turn. `cascade`
-escalates from weak to strong when request signals call for it. The
-[Routing Overview](routing_algorithms/overview.md) covers when to use each and
-how to tune it.
+## Routing Algorithms
 
-!!! warning "There is no `type: model`"
-    The current profile config does not have a `type: model`. To expose a single
-    model, point clients at a target ID directly, or add a `passthrough` profile
-    when you want a second name for it. `type: model` survives only in the
-    deprecated `--routing-profiles` bundles used by the launcher compatibility
-    path.
+An algorithm receives the normalized request, publishes a routing decision,
+and serves the selected target. The standalone server supports these primary
+route types:
 
-Session affinity, or sticky routing, pins a conversation to one tier so later
-turns reuse it instead of being classified again. It belongs to `llm-routing`
-and is not a strategy of its own; random and cascade routing decide every
-request on its own merits. [Sticky Routing](routing_algorithms/sticky_routing.md)
-covers it in full.
+| Route type | Behavior |
+|---|---|
+| `passthrough` | Sends every request to one target. |
+| `random` | Selects among targets using optional relative weights. |
+| `llm_classifier` | Uses a classifier target to choose between weak and strong targets. |
+| `stage_router` | Uses tool-result and progress signals to choose an efficient or capable target. |
 
-## Formats and translation
+Strong, weak, capable, and efficient are roles within an algorithm, not fixed
+properties of a model. The same upstream model can serve different roles in
+different routes.
 
-Clients reach Switchyard in one of three inbound formats: OpenAI Chat
-Completions, Anthropic Messages, or OpenAI Responses. Each target has its own
-backend format, set by its `format:` field, which is one of `openai`,
-`anthropic`, `responses`, or `auto`. When the two differ, Switchyard translates
-the request on the way out and the response on the way back.
+## Protocol Types and Translation
 
-That translation is what lets Claude Code, which speaks Anthropic Messages, run
-against an OpenAI-compatible model, and the reverse. The
-[Architecture](architecture.md) page documents every backend format, the `auto`
-probe, and the neutral representation used to convert between them.
+`switchyard-protocol` defines provider-neutral requests, responses, messages,
+content blocks, tool calls, usage, and streaming events. Algorithms operate on
+these types rather than provider SDK objects.
 
-## Where to go next
+Each LLM client explicitly selects one upstream format:
 
-- [Getting Started](getting_started.md) to install and send a first request.
-- [Routing Overview](routing_algorithms/overview.md) to choose and tune a strategy.
-- [Agent Launchers](guides/agent_launchers.md) to run Claude Code, Codex, or OpenClaw.
-- [Architecture](architecture.md) to see a request travel end to end.
-- [CLI Reference](cli_reference.md) for flags and environment variables.
+- `openai_chat`
+- `openai_responses`
+- `anthropic_messages`
+
+`switchyard-translation` converts requests, buffered responses, and streaming
+events between those formats. This lets a client keep its native API while the
+selected target uses a different upstream protocol.
+
+## Where to Go Next
+
+- [Getting Started](getting_started.md): install and run either execution path.
+- [Server CLI Reference](cli_reference.md): standalone server arguments.
+- [LLM Classifier Routing](routing_algorithms/llm_classifier_routing.md): configure classifier routing.
+- [Architecture](architecture.md): follow a request through the server and Rust crates.
+- [`switchyard-server`](../crates/switchyard-server/README.md): complete TOML schema, endpoints, and metrics.
+- [`switchyard-libsy`](../crates/libsy/README.md): embed and extend routing algorithms in Rust.
+- [Rust API reference](reference/rust_api.md): generated libsy and protocol documentation.

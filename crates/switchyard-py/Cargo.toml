@@ -3,7 +3,7 @@
 
 [package]
 name = "switchyard-py"
-version = "0.1.0"
+version.workspace = true
 description = "PyO3 bindings for Switchyard Rust crates"
 authors.workspace = true
 edition.workspace = true
@@ -16,17 +16,14 @@ name = "_switchyard_rust"
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
-async-trait = "0.1"
-futures-util = "0.3"
-pyo3 = { version = "0.28.3", features = ["abi3-py312", "extension-module"] }
+futures.workspace = true
+http.workspace = true
+switchyard-libsy.workspace = true
+pyo3 = { version = "0.28.3", features = ["abi3-py310"] }
 pyo3-async-runtimes = { version = "0.28", features = ["tokio-runtime"] }
 pythonize = "0.28.0"
-serde = "1"
-serde_json = "1"
-switchyard-core = { path = "../switchyard-core" }
-switchyard-components = { path = "../switchyard-components" }
-switchyard-components-v2 = { path = "../switchyard-components-v2" }
-switchyard-server = { path = "../switchyard-server" }
-switchyard-translation = { path = "../switchyard-translation" }
-tokio = { version = "1", features = ["rt", "rt-multi-thread", "sync"] }
-tracing = { version = "0.1", default-features = false, features = ["std"] }
+serde.workspace = true
+serde_json.workspace = true
+switchyard-protocol.workspace = true
+switchyard-server.workspace = true
+tokio.workspace = true

@@ -16,11 +16,12 @@ import json
 import shutil
 import socket
 import subprocess
-from datetime import UTC, datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 SCHEMA_VERSION = 1
+UTC = timezone.utc
 
 
 def _iso_timestamp() -> str:
@@ -78,6 +79,14 @@ def _harbor_version(harbor_command: list[str] | None = None) -> str | None:
     return result[1].splitlines()[0] if result[1] else None
 
 
+def _file_digest(path: Path) -> bytes:
+    hasher = hashlib.sha256()
+    with path.open("rb") as file:
+        for chunk in iter(lambda: file.read(1024 * 1024), b""):
+            hasher.update(chunk)
+    return hasher.digest()
+
+
 def path_digest(path: Path) -> str:
     """Return a deterministic sha256 digest for a file or directory."""
     try:
@@ -85,14 +94,12 @@ def path_digest(path: Path) -> str:
         hasher = hashlib.sha256()
         if resolved.is_file():
             hasher.update(resolved.name.encode())
-            with resolved.open("rb") as fh:
-                hasher.update(hashlib.file_digest(fh, "sha256").digest())
+            hasher.update(_file_digest(resolved))
             return f"sha256:{hasher.hexdigest()}"
         if resolved.is_dir():
             for item in sorted(p for p in resolved.rglob("*") if p.is_file()):
                 rel = item.relative_to(resolved).as_posix()
-                with item.open("rb") as fh:
-                    file_hash = hashlib.file_digest(fh, "sha256").hexdigest()
+                file_hash = _file_digest(item).hex()
                 hasher.update(f"{rel}\n{file_hash}\n".encode())
             return f"sha256:{hasher.hexdigest()}"
     except OSError:
@@ -117,14 +124,14 @@ def dataset_fingerprint(
     return f"sha256:{hashlib.sha256(encoded).hexdigest()}"
 
 
-def snapshot_routing_profiles(source: Path | None, run_dir: Path) -> Path | None:
-    """Copy the route bundle used for the run into the run directory."""
+def snapshot_server_config(source: Path | None, run_dir: Path) -> Path | None:
+    """Copy the Rust server configuration used for the run."""
     if source is None:
         return None
     if not source.is_file():
         raise FileNotFoundError(source)
 
-    dest = run_dir.resolve() / "routing_profiles" / source.name
+    dest = run_dir.resolve() / "server_config" / source.name
     dest.parent.mkdir(parents=True, exist_ok=True)
     shutil.copyfile(source, dest)
     return dest
@@ -228,8 +235,13 @@ def finalize_manifest(
     *,
     harbor_rc: int | None,
     harbor_job_dir: Path | None = None,
+    server_metrics: Path | None = None,
     routing_stats: Path | None = None,
 ) -> int:
+    """Copy run artifacts into place and record outcomes.
+
+    Returns 0 on success, 1 when the manifest is missing.
+    """
     if not path.is_file():
         print(f"ERROR: manifest not found: {path}")
         return 1
@@ -242,6 +254,14 @@ def finalize_manifest(
     outcomes["harbor_result_json_status"] = _copy_if_present(harbor_source, harbor_dest)
     if harbor_job_dir is not None:
         outcomes["harbor_job_dir"] = str(harbor_job_dir.resolve())
+
+    metrics_dest = (
+        Path(outcomes["server_metrics_prom"]) if outcomes.get("server_metrics_prom") else None
+    )
+    if outcomes.get("server_metrics_prom_status") != "not-requested":
+        if server_metrics is None and metrics_dest is not None:
+            server_metrics = metrics_dest
+        outcomes["server_metrics_prom_status"] = _copy_if_present(server_metrics, metrics_dest)
 
     stats_dest = (
         Path(outcomes["routing_stats_json"]) if outcomes.get("routing_stats_json") else None
@@ -302,12 +322,11 @@ def _cli_main(argv: list[str] | None = None) -> int:
     write.add_argument("--server-port", type=int, default=0)
     write.add_argument("--server-argv-json", default="[]")
     write.add_argument("--server-config-json", default="{}")
-    write.add_argument("--classifier-prompts-json", default="{}")
     write.add_argument("--harbor-server-url", default="")
     write.add_argument("--harbor-base-url", default="")
     write.add_argument("--upstream-base-url", default="")
     write.add_argument("--upstream-api-key-env", default="")
-    write.add_argument("--routing-profiles", type=Path, default=None)
+    write.add_argument("--server-config", type=Path, default=None)
     write.add_argument("--route-model", default="")
     write.add_argument("--harbor-command-json", default="[]")
     write.add_argument("--dataset-label", default="")
@@ -332,6 +351,8 @@ def _cli_main(argv: list[str] | None = None) -> int:
     write.add_argument("--run-dir", type=Path, required=True)
     write.add_argument("--log-path", type=Path, required=True)
     write.add_argument("--harbor-result-json", type=Path, required=True)
+    write.add_argument("--server-metrics-prom", type=Path, default=None)
+    write.add_argument("--server-metrics-status", default="not-requested")
     write.add_argument("--routing-stats-json", type=Path, required=True)
     write.add_argument("--routing-stats-status", default="predicted")
     write.add_argument("--extra", action="append", default=[])
@@ -340,6 +361,7 @@ def _cli_main(argv: list[str] | None = None) -> int:
     finalize.add_argument("--manifest", type=Path, required=True)
     finalize.add_argument("--harbor-rc", type=int, default=None)
     finalize.add_argument("--harbor-job-dir", type=Path, default=None)
+    finalize.add_argument("--server-metrics", type=Path, default=None)
     finalize.add_argument("--routing-stats", type=Path, default=None)
 
     ns = parser.parse_args(argv)
@@ -348,6 +370,7 @@ def _cli_main(argv: list[str] | None = None) -> int:
             ns.manifest,
             harbor_rc=ns.harbor_rc,
             harbor_job_dir=ns.harbor_job_dir,
+            server_metrics=ns.server_metrics,
             routing_stats=ns.routing_stats,
         )
     if ns.command != "write":
@@ -355,18 +378,14 @@ def _cli_main(argv: list[str] | None = None) -> int:
         return 2
 
     task_list = ns.task_list_file.resolve() if ns.task_list_file else None
-    routing_profiles = ns.routing_profiles.resolve() if ns.routing_profiles else None
+    server_config = ns.server_config.resolve() if ns.server_config else None
     harbor_path = ns.harbor_path.resolve() if ns.harbor_path else None
     codex_model_catalog = (
         ns.codex_model_catalog.resolve() if ns.codex_model_catalog else None
     )
     run_dir = ns.run_dir.resolve()
-    classifier_prompts = _json_arg(ns.classifier_prompts_json, {})
-    if not isinstance(classifier_prompts, dict):
-        print("ERROR: --classifier-prompts-json must decode to a JSON object")
-        return 2
     try:
-        routing_profiles_snapshot = snapshot_routing_profiles(routing_profiles, run_dir)
+        server_config_snapshot = snapshot_server_config(server_config, run_dir)
         dataset_manifest_snapshot = snapshot_dataset_manifest(harbor_path, run_dir)
     except OSError as exc:
         print(f"ERROR: failed to snapshot run inputs: {exc}")
@@ -426,20 +445,17 @@ def _cli_main(argv: list[str] | None = None) -> int:
             "port": ns.server_port or None,
             "argv": _json_arg(ns.server_argv_json, []),
             "config": _json_arg(ns.server_config_json, {}),
-            "classifier_prompts": classifier_prompts,
             "harbor_server_url": _opt(ns.harbor_server_url),
             "harbor_base_url": _opt(ns.harbor_base_url),
             "upstream_base_url": _opt(ns.upstream_base_url),
             "upstream_api_key_env": _opt(ns.upstream_api_key_env),
-            "routing_profiles": str(routing_profiles) if routing_profiles else None,
-            "routing_profiles_digest": (
-                path_digest(routing_profiles) if routing_profiles else None
+            "server_config": str(server_config) if server_config else None,
+            "server_config_digest": path_digest(server_config) if server_config else None,
+            "server_config_snapshot": (
+                str(server_config_snapshot) if server_config_snapshot else None
             ),
-            "routing_profiles_snapshot": (
-                str(routing_profiles_snapshot) if routing_profiles_snapshot else None
-            ),
-            "routing_profiles_snapshot_digest": (
-                path_digest(routing_profiles_snapshot) if routing_profiles_snapshot else None
+            "server_config_snapshot_digest": (
+                path_digest(server_config_snapshot) if server_config_snapshot else None
             ),
             "route_model": _opt(ns.route_model),
         },
@@ -455,6 +471,10 @@ def _cli_main(argv: list[str] | None = None) -> int:
             "log_path": str(ns.log_path.resolve()),
             "harbor_result_json": str(ns.harbor_result_json.resolve()),
             "harbor_result_json_status": "predicted",
+            "server_metrics_prom": (
+                str(ns.server_metrics_prom.resolve()) if ns.server_metrics_prom else None
+            ),
+            "server_metrics_prom_status": ns.server_metrics_status,
             "routing_stats_json": str(ns.routing_stats_json.resolve()),
             "routing_stats_json_status": ns.routing_stats_status,
             "harbor_rc": None,

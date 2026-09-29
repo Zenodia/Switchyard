@@ -2,6 +2,36 @@
 
 Thank you for your interest in contributing! This document outlines the development workflow, testing practices, and code standards.
 
+## External Contributions
+
+We welcome contributions of all sizes, from typo fixes to new features. The short version:
+
+1. [Fork the repository](https://github.com/NVIDIA-NeMo/Switchyard/fork) and clone your fork:
+
+   ```bash
+   git clone https://github.com/YOUR-USERNAME/Switchyard.git
+   cd Switchyard
+   git remote add upstream https://github.com/NVIDIA-NeMo/Switchyard.git
+   ```
+
+2. Pick the right process for the size of your change:
+   - **Small changes** (typos, docs, focused bug fixes under ~100 lines): open a PR directly, no issue needed.
+   - **Larger changes** (new features, refactors, anything 100+ lines): [open an issue](https://github.com/NVIDIA-NeMo/Switchyard/issues/new/choose) first so maintainers can confirm the direction before you invest time.
+
+3. Create a branch, make your change, and run the checks in [Code standards](#2-code-standards).
+
+4. Commit with a DCO sign-off (see [Signing Your Work](#signing-your-work)):
+
+   ```bash
+   git commit -s -m "fix: description of the change"
+   ```
+
+5. Push to your fork and open a PR against `main`, linking any related issues (e.g. "Closes #42").
+
+Review is requested automatically from the core team via [CODEOWNERS](.github/CODEOWNERS), so there is no need to pick reviewers. Keep each PR focused on one concern, include tests for behavior changes, and respond to feedback with follow-up commits rather than force-pushes.
+
+Using AI tools to write code is fine, but you must understand and be able to explain every change in your PR.
+
 ## Setup
 
 See [Development](DEVELOPMENT.md) for full setup instructions.
@@ -43,6 +73,11 @@ uv run mypy switchyard
 
 # Tests — no failures
 uv run pytest tests/ -v
+
+# Rust formatting, linting, and tests
+cargo fmt --all --check
+cargo clippy --workspace --all-targets -- -D warnings
+cargo test --workspace
 ```
 
 These commands run in CI on every push. **Fix linting errors locally before pushing:**
@@ -57,8 +92,11 @@ Commit messages must follow
 [Conventional Commits v1.0.0](https://www.conventionalcommits.org/en/v1.0.0/).
 This is enforced locally by the `commit-msg` hook and in GitHub Actions.
 
+Every commit must also carry a DCO sign-off (`git commit -s`), enforced by the
+required DCO check on every PR. See [Signing Your Work](#signing-your-work).
+
 - ✓ `fix: handle async context cleanup in ProxyContext`
-- ✓ `feat: add cascade routing backend`
+- ✓ `feat: add stage-router routing backend`
 - ✗ `Fixed stuff` / `Updated code`
 
 Use one of:
@@ -75,7 +113,7 @@ Use one of:
 - `revert:` — revert a previous commit
 - `style:` — formatting-only changes
 
-Scopes are optional: `fix(cli): preserve launcher args`.
+Scopes are optional: `fix(cli): preserve command arguments`.
 Breaking changes use `!` or a `BREAKING CHANGE:` footer:
 
 ```text
@@ -97,6 +135,9 @@ feat(api)!: remove legacy route option
    uv run ruff check .
    uv run mypy switchyard
    uv run pytest tests/ -v
+   cargo fmt --all --check
+   cargo clippy --workspace --all-targets -- -D warnings
+   cargo test --workspace
    ```
 
 4. **Push and open a PR** on GitHub. Include:
@@ -110,10 +151,8 @@ feat(api)!: remove legacy route option
    Keep the PR title conventional too, because GitHub can use the PR title for
    the squash-merge commit.
 
-Maintainers should mark these GitHub status checks as required on `main`:
-
-- `Commitlint / Commit messages`
-- `PR Title / Validate PR title`
+The `CI Success` and `DCO` status checks are required on `main`; the other
+workflows (commitlint, PR title) run on every PR but are advisory.
 
 ## Testing
 
@@ -121,6 +160,7 @@ Maintainers should mark these GitHub status checks as required on `main`:
 
 ```bash
 uv run pytest tests/ -v
+cargo test --workspace
 ```
 
 ### Integration tests (requires API keys)
@@ -136,19 +176,37 @@ The default unit test suite runs with no network access and no API keys. Live, e
 
 ## Architecture
 
-See [Agents](AGENTS.md) for the full architecture guide. Key points:
+See [Architecture](docs/architecture.md) for the request lifecycle and
+[Agents](AGENTS.md) for crate boundaries and repository conventions. The
+supported serving path is native Rust:
 
-- **Typed requests/responses** — use `ChatRequest` and `ChatResponse` subtypes
-- **Composable chain** — `RequestProcessor` → `LLMBackend` → `ResponseProcessor` → `TranslationEngine`
-- **Recipes** — pre-built chains in `switchyard/lib/recipes.py`
+```text
+HTTP request
+  → switchyard-server
+  → switchyard-translation (decode)
+  → libsy
+  → libsy-llm-client
+  → switchyard-translation (encode)
+  → upstream model
+```
 
-When adding a new component:
+Before making a change, identify the surface that owns it:
 
-1. Decide the role: `RequestProcessor`, `LLMBackend`, `ResponseProcessor`, or translation engine work.
-2. Subclass the ABC from `switchyard/lib/roles.py`.
-3. Put Python middleware in the matching subpackage (`switchyard/lib/processors/`, `switchyard/lib/backends/`) and provider translation logic in `crates/switchyard-translation`.
-4. Add tests in `tests/`.
-5. Export from the relevant `__init__.py` and from `switchyard/__init__.py`'s `__all__`.
+- Put routing algorithms and driver behavior in `crates/libsy`.
+- Put provider-neutral request and response types in `crates/protocol`.
+- Put translated HTTP calls in `crates/libsy-llm-client`.
+- Put wire-format conversion in `crates/switchyard-translation`.
+- Put HTTP serving and deployment configuration in `crates/switchyard-server`.
+- Put source-neutral skill-distillation records and port traits in
+  `crates/switchyard-skill-distillation`; that crate does not own workflow
+  orchestration. Test its public contracts in
+  `crates/switchyard-skill-distillation/tests/contracts.rs`.
+- Put native Python bindings in `crates/switchyard-py`; keep Python wrappers in
+  `switchyard/libsy` or `switchyard_rust`.
+
+Add Rust tests in the owning crate and Python tests in `tests/`. Export new
+public symbols from the owning crate or package rather than the top-level
+`switchyard` package unless that package owns the API.
 
 ## Documentation
 

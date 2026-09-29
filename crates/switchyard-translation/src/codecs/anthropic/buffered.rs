@@ -3,9 +3,12 @@
 
 //! Buffered codec for Anthropic Messages request and response JSON.
 
-use serde_json::{json, Map, Value};
+use serde_json::{Map, Value, json};
 
-use crate::codecs::common::{provider_extensions, text_from_blocks};
+use crate::codecs::common::{
+    ANTHROPIC_REQUEST_KEY, is_anthropic_request, is_known_role_name, provider_extensions,
+    text_from_blocks,
+};
 use crate::codecs::openai_chat::{decode_file_source, decode_image_source};
 use crate::codecs::{
     DecodedRequest, DecodedResponse, EncodedRequest, EncodedResponse, FormatCodec,
@@ -13,21 +16,22 @@ use crate::codecs::{
 use crate::diagnostic::TranslationDiagnostic;
 use crate::error::{Result, TranslationError};
 use crate::format::{FormatId, WireFormat};
-use crate::ir::{
-    is_known_role_name, ContentBlock, ConversationRequest, ConversationResponse, FileSource,
-    ImageSource, InstructionBlock, MediaSource, Message, OutputParams, ProviderExtensions,
-    ReasoningParams, ResponseOutput, Role, SamplingParams, StopReason, ToolCall, ToolChoice,
-    ToolDefinition, ToolResult, Usage,
+use crate::llm::{
+    AggLlmResponse, ContentBlock, FileSource, ImageSource, InstructionBlock, LlmRequest,
+    MediaSource, Message, OutputParams, ProviderExtensions, ReasoningParams, ResponseOutput, Role,
+    SamplingParams, StopReason, ToolCall, ToolChoice, ToolDefinition, ToolResult, Usage,
 };
 use crate::policy::{DeterministicIdPolicy, TranslationPolicy};
-use crate::util::sanitize_anthropic_tool_use_id;
 use crate::util::{
-    capture_request_preservation, capture_response_preservation, embed_preservation,
-    exact_preserved_request, exact_preserved_response,
+    capture_request_preservation, capture_response_preservation, desanitize_anthropic_tool_use_id,
+    embed_preservation, exact_preserved_request, exact_preserved_response,
+    sanitize_anthropic_tool_use_id,
 };
 use crate::util::{
-    json_string, push_lossy, stable_id, string_value, validate_request_capabilities,
+    json_string, push_lossy, reject_responses_builtin_tool_item, stable_id, string_value,
+    validate_request_capabilities,
 };
+use base64::{Engine as _, engine::general_purpose::STANDARD};
 
 /// Format codec for Anthropic Messages payloads.
 pub struct AnthropicMessagesCodec;
@@ -40,15 +44,27 @@ impl FormatCodec for AnthropicMessagesCodec {
     fn decode_request(&self, body: &Value, policy: &TranslationPolicy) -> Result<DecodedRequest> {
         let body = crate::util::object(body, "$")?;
         let mut diagnostics = Vec::new();
-        let mut request = ConversationRequest {
+        let max_output_tokens = body
+            .get("max_tokens")
+            .map(|value| {
+                value
+                    .as_u64()
+                    .ok_or_else(|| TranslationError::InvalidValue {
+                        path: "$.max_tokens".to_string(),
+                        message: "expected a non-negative integer".to_string(),
+                    })
+            })
+            .transpose()?;
+        let response_format = decode_anthropic_output_format(body, &mut diagnostics, policy)?;
+        let mut request = LlmRequest {
             model: body
                 .get("model")
                 .and_then(Value::as_str)
                 .filter(|model| !model.is_empty())
                 .map(ToOwned::to_owned),
             output: OutputParams {
-                max_output_tokens: body.get("max_tokens").and_then(Value::as_u64),
-                response_format: None,
+                max_output_tokens,
+                response_format,
             },
             sampling: SamplingParams {
                 temperature: body.get("temperature").and_then(Value::as_f64),
@@ -70,17 +86,23 @@ impl FormatCodec for AnthropicMessagesCodec {
                 &Value::Object(body.clone()),
                 policy,
             ),
-            ..ConversationRequest::default()
+            ..LlmRequest::default()
         };
-        if let Some(system) = body.get("system") {
-            if let Some(content) = decode_anthropic_system(system, &mut diagnostics, policy)? {
-                request.instructions.push(InstructionBlock {
-                    role: Role::System,
-                    content,
-                });
-            }
+        if let Some(system) = body.get("system")
+            && let Some(content) = decode_anthropic_system(system)?
+        {
+            request.instructions.push(InstructionBlock {
+                role: Role::System,
+                content,
+            });
         }
-        if let Some(messages) = body.get("messages").and_then(Value::as_array) {
+        if let Some(messages) = body.get("messages") {
+            let messages = messages
+                .as_array()
+                .ok_or_else(|| TranslationError::InvalidType {
+                    path: "$.messages".to_string(),
+                    expected: "array",
+                })?;
             let mut generated_id = 0;
             for (index, message) in messages.iter().enumerate() {
                 let Some(message) = message.as_object() else {
@@ -136,9 +158,26 @@ impl FormatCodec for AnthropicMessagesCodec {
                 "top_k",
                 "thinking",
                 "output_config",
+                "output_format",
                 "stream",
+                // OpenAI-only identity fields must not leak through Anthropic decoding.
+                "safety_identifier",
             ],
         );
+        if let Some(is_disabled) = body
+            .get("tool_choice")
+            .and_then(|choice| choice.get("disable_parallel_tool_use"))
+            .and_then(Value::as_bool)
+        {
+            request
+                .extensions
+                .fields
+                .insert("parallel_tool_calls".to_string(), Value::Bool(!is_disabled));
+        }
+        request
+            .extensions
+            .fields
+            .insert(ANTHROPIC_REQUEST_KEY.to_string(), Value::Bool(true));
 
         Ok(DecodedRequest {
             request,
@@ -148,7 +187,7 @@ impl FormatCodec for AnthropicMessagesCodec {
 
     fn encode_request(
         &self,
-        request: &ConversationRequest,
+        request: &LlmRequest,
         policy: &TranslationPolicy,
     ) -> Result<EncodedRequest> {
         if let Some(body) =
@@ -161,6 +200,11 @@ impl FormatCodec for AnthropicMessagesCodec {
         }
         let mut diagnostics = Vec::new();
         validate_request_capabilities(request, &mut diagnostics, policy)?;
+        let allowed = crate::codecs::common::allowed_function_tools(request)?;
+        let (tools, tool_choice) = allowed.as_ref().map_or(
+            (request.tools.as_slice(), request.tool_choice.as_ref()),
+            |(tools, choice)| (tools.as_slice(), Some(choice)),
+        );
         let mut body = Map::new();
         if let Some(model) = &request.model {
             body.insert("model".to_string(), Value::String(model.clone()));
@@ -188,24 +232,52 @@ impl FormatCodec for AnthropicMessagesCodec {
             )?),
         );
 
-        if !request.tools.is_empty() {
-            body.insert("tools".to_string(), encode_anthropic_tools(&request.tools));
+        if !tools.is_empty() {
+            body.insert("tools".to_string(), encode_anthropic_tools(tools));
         }
-        if let Some(choice) = &request.tool_choice {
-            body.insert(
-                "tool_choice".to_string(),
-                encode_anthropic_tool_choice(choice),
-            );
+        let parallel_tool_calls = request
+            .extensions
+            .fields
+            .get("parallel_tool_calls")
+            .and_then(Value::as_bool);
+        if tool_choice.is_some() || (parallel_tool_calls.is_some() && !tools.is_empty()) {
+            let mut choice = encode_anthropic_tool_choice(tool_choice.unwrap_or(&ToolChoice::Auto));
+            if let Some(is_enabled) = parallel_tool_calls
+                && let Some(object) = choice.as_object_mut()
+                && object.get("type").and_then(Value::as_str) != Some("none")
+            {
+                object.insert(
+                    "disable_parallel_tool_use".to_string(),
+                    Value::Bool(!is_enabled),
+                );
+            }
+            body.insert("tool_choice".to_string(), choice);
+        }
+        if is_anthropic_request(request) {
+            for field in [
+                "inference_geo",
+                "service_tier",
+                "stop_sequences",
+                "metadata",
+                "cache_control",
+                "container",
+                "speed",
+                "diagnostics",
+            ] {
+                if let Some(value) = request.extensions.fields.get(field) {
+                    body.insert(field.to_string(), value.clone());
+                }
+            }
         }
         if let Some(stop_sequences) =
             anthropic_stop_sequences_from_extensions(&request.extensions.fields)
         {
-            body.insert("stop_sequences".to_string(), stop_sequences);
+            body.entry("stop_sequences").or_insert(stop_sequences);
         }
         if let Some(max_tokens) = request.output.max_output_tokens {
             body.insert("max_tokens".to_string(), json!(max_tokens));
         } else {
-            body.insert("max_tokens".to_string(), json!(128_000));
+            body.insert("max_tokens".to_string(), json!(64_000));
         }
         if let Some(value) = request.sampling.temperature {
             body.insert("temperature".to_string(), json!(value));
@@ -222,6 +294,21 @@ impl FormatCodec for AnthropicMessagesCodec {
         if let Some(effort) = &request.reasoning.effort {
             body.insert("thinking".to_string(), json!({"type": "adaptive"}));
             body.insert("output_config".to_string(), json!({"effort": effort}));
+        }
+        if let Some(response_format) = &request.output.response_format
+            && let Some(format) =
+                encode_anthropic_output_format(response_format, &mut diagnostics, policy)?
+        {
+            let output_config = body
+                .entry("output_config".to_string())
+                .or_insert_with(|| Value::Object(Map::new()));
+            let Some(output_config) = output_config.as_object_mut() else {
+                return Err(TranslationError::InvalidType {
+                    path: "$.output_config".to_string(),
+                    expected: "object",
+                });
+            };
+            output_config.insert("format".to_string(), format);
         }
 
         let body = embed_preservation(Value::Object(body), &request.preservation, policy);
@@ -253,7 +340,7 @@ impl FormatCodec for AnthropicMessagesCodec {
                 text: String::new(),
             });
         }
-        let response = ConversationResponse {
+        let response = AggLlmResponse {
             id: body
                 .get("id")
                 .and_then(Value::as_str)
@@ -263,6 +350,7 @@ impl FormatCodec for AnthropicMessagesCodec {
                 .and_then(Value::as_str)
                 .map(ToOwned::to_owned),
             outputs: vec![ResponseOutput {
+                url_citations: Vec::new(),
                 role: Role::Assistant,
                 content,
                 stop_reason: Some(map_anthropic_stop_reason(
@@ -298,9 +386,10 @@ impl FormatCodec for AnthropicMessagesCodec {
 
     fn encode_response(
         &self,
-        response: &ConversationResponse,
+        response: &AggLlmResponse,
         _policy: &TranslationPolicy,
     ) -> Result<EncodedResponse> {
+        super::super::responses::validate_response_output(response, WireFormat::AnthropicMessages)?;
         if let Some(body) = exact_preserved_response(
             &response.preservation,
             WireFormat::AnthropicMessages,
@@ -314,18 +403,24 @@ impl FormatCodec for AnthropicMessagesCodec {
         let output = response.first_output();
         let content = output
             .map(|output| encode_anthropic_content(&output.content))
+            .transpose()?
             .unwrap_or_else(|| vec![json!({"type": "text", "text": ""})]);
+        let normalized_stop_reason = output.and_then(|output| output.stop_reason);
         let body = json!({
             "id": response.id.clone().unwrap_or_else(|| "msg_switchyard".to_string()),
             "type": "message",
             "role": "assistant",
             "model": response.model.clone().unwrap_or_else(|| "unknown".to_string()),
             "content": content,
-            "stop_reason": output
-                .and_then(|output| output.stop_reason)
+            "stop_reason": normalized_stop_reason
                 .map(anthropic_stop_reason)
                 .unwrap_or("end_turn"),
             "stop_sequence": Value::Null,
+            "stop_details": normalized_stop_reason
+                .map(|reason| {
+                    anthropic_stop_details(reason, response.extensions.fields.get("stop_details"))
+                })
+                .unwrap_or(Value::Null),
             "usage": encode_anthropic_usage(&response.usage),
         });
         Ok(EncodedResponse {
@@ -335,12 +430,121 @@ impl FormatCodec for AnthropicMessagesCodec {
     }
 }
 
-// Decodes Anthropic's `system` field into instruction blocks.
-fn decode_anthropic_system(
-    value: &Value,
+// Reads the current `output_config.format`, or the beta `output_format` it replaced,
+// into the neutral OpenAI-shaped response format.
+fn decode_anthropic_output_format(
+    body: &Map<String, Value>,
     diagnostics: &mut Vec<TranslationDiagnostic>,
     policy: &TranslationPolicy,
-) -> Result<Option<Vec<ContentBlock>>> {
+) -> Result<Option<Value>> {
+    let Some(format) = body
+        .get("output_config")
+        .and_then(Value::as_object)
+        .and_then(|config| config.get("format"))
+        .or_else(|| body.get("output_format"))
+    else {
+        return Ok(None);
+    };
+    let Some(format) = format.as_object() else {
+        push_lossy(
+            diagnostics,
+            policy,
+            "Anthropic structured output format is not an object; the requested format was dropped",
+        )?;
+        return Ok(None);
+    };
+    if format.get("type").and_then(Value::as_str) != Some("json_schema") {
+        push_lossy(
+            diagnostics,
+            policy,
+            "Anthropic structured output maps only a json_schema format; the requested format was dropped",
+        )?;
+        return Ok(None);
+    }
+    // A non-object schema would reach the upstream as a malformed `json_schema.schema`.
+    let Some(schema) = format.get("schema").filter(|schema| schema.is_object()) else {
+        push_lossy(
+            diagnostics,
+            policy,
+            "Anthropic structured output requires format.schema to be an object; the requested format was dropped",
+        )?;
+        return Ok(None);
+    };
+    Ok(Some(json!({
+        "type": "json_schema",
+        "json_schema": {
+            // Anthropic identifies the schema by position; the neutral shape needs a name.
+            "name": "response",
+            "schema": schema.clone(),
+        },
+    })))
+}
+
+/// Maps the neutral OpenAI-shaped JSON schema to Anthropic's output format.
+fn encode_anthropic_output_format(
+    response_format: &Value,
+    diagnostics: &mut Vec<TranslationDiagnostic>,
+    policy: &TranslationPolicy,
+) -> Result<Option<Value>> {
+    let Some(json_schema) = response_format
+        .as_object()
+        .filter(|format| format.get("type").and_then(Value::as_str) == Some("json_schema"))
+        .and_then(|format| format.get("json_schema"))
+        .and_then(Value::as_object)
+    else {
+        push_lossy(
+            diagnostics,
+            policy,
+            "Anthropic structured output requires an OpenAI JSON schema response format",
+        )?;
+        return Ok(None);
+    };
+    let Some(schema) = json_schema.get("schema") else {
+        push_lossy(
+            diagnostics,
+            policy,
+            "Anthropic structured output requires json_schema.schema",
+        )?;
+        return Ok(None);
+    };
+
+    let mut schema = schema.clone();
+    if strip_anthropic_unsupported_constraints(&mut schema) {
+        push_lossy(
+            diagnostics,
+            policy,
+            "Anthropic structured output dropped unsupported JSON Schema constraints",
+        )?;
+    }
+    Ok(Some(json!({"type": "json_schema", "schema": schema})))
+}
+
+/// Removes constraints unsupported by Anthropic's structured-output grammar.
+fn strip_anthropic_unsupported_constraints(value: &mut Value) -> bool {
+    match value {
+        Value::Object(object) => {
+            let mut removed = false;
+            for key in ["minimum", "maximum", "minLength", "maxLength"] {
+                removed |= object.remove(key).is_some();
+            }
+            for value in object.values_mut() {
+                removed |= strip_anthropic_unsupported_constraints(value);
+            }
+            removed
+        }
+        Value::Array(values) => {
+            let mut removed = false;
+            for value in values {
+                removed |= strip_anthropic_unsupported_constraints(value);
+            }
+            removed
+        }
+        _ => false,
+    }
+}
+
+// Decodes Anthropic's `system` field into instruction blocks.
+fn decode_anthropic_system(value: &Value) -> Result<Option<Vec<ContentBlock>>> {
     match value {
         Value::String(text) if !text.is_empty() => {
             Ok(Some(vec![ContentBlock::Text { text: text.clone() }]))
@@ -349,25 +553,23 @@ fn decode_anthropic_system(
         Value::Array(blocks) => {
             let mut content = Vec::new();
             for block in blocks {
-                if let Some(block) = block.as_object() {
-                    if block.get("type").and_then(Value::as_str) == Some("text") {
-                        let text = block
-                            .get("text")
-                            .and_then(Value::as_str)
-                            .unwrap_or_default()
-                            .to_string();
-                        content.push(ContentBlock::Text { text });
-                    }
+                if let Some(block) = block.as_object()
+                    && block.get("type").and_then(Value::as_str) == Some("text")
+                {
+                    let text = block
+                        .get("text")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_string();
+                    content.push(ContentBlock::Text { text });
                 }
             }
             Ok((!content.is_empty()).then_some(content))
         }
-        other => {
-            push_lossy(diagnostics, policy, "Anthropic system field was not text")?;
-            Ok(Some(vec![ContentBlock::Text {
-                text: string_value(other).unwrap_or_default(),
-            }]))
-        }
+        _ => Err(TranslationError::InvalidType {
+            path: "$.system".to_string(),
+            expected: "string or array of text blocks",
+        }),
     }
 }
 
@@ -443,13 +645,14 @@ fn decode_anthropic_content_block(
                 .and_then(Value::as_str)
                 .filter(|signature| !signature.is_empty())
                 .map(ToOwned::to_owned),
+            details: Vec::new(),
         }],
         Some("tool_use") => vec![ContentBlock::ToolCall(ToolCall {
             id: block
                 .get("id")
                 .and_then(Value::as_str)
                 .filter(|id| !id.is_empty())
-                .map(ToOwned::to_owned)
+                .map(desanitize_anthropic_tool_use_id)
                 .unwrap_or_else(|| match &policy.deterministic_ids {
                     DeterministicIdPolicy::GenerateStable { prefix } => {
                         stable_id(prefix, generated_counter)
@@ -467,24 +670,22 @@ fn decode_anthropic_content_block(
             tool_call_id: block
                 .get("tool_use_id")
                 .and_then(Value::as_str)
-                .unwrap_or_default()
-                .to_string(),
+                .map(desanitize_anthropic_tool_use_id)
+                .unwrap_or_default(),
             content: decode_tool_result_content(block.get("content").unwrap_or(&Value::Null)),
             is_error: block.get("is_error").and_then(Value::as_bool),
         })],
-        Some("image") => {
-            let source = block
-                .get("source")
-                .cloned()
-                .map(ImageSource::Raw)
-                .unwrap_or_else(|| ImageSource::Raw(Value::Object(block.clone())));
-            vec![ContentBlock::Image { source }]
-        }
+        Some("image") => vec![ContentBlock::Image {
+            source: ImageSource::Raw(Value::Object(block.clone())),
+        }],
         Some("input_image") | Some("image_url") => decode_image_source(block)
             .map(|source| vec![ContentBlock::Image { source }])
             .unwrap_or_default(),
         Some("input_file") | Some("file") => vec![ContentBlock::File {
             source: decode_file_source(block),
+        }],
+        Some("document") => vec![ContentBlock::File {
+            source: decode_anthropic_file_source(block),
         }],
         _ => vec![ContentBlock::Unknown {
             provider: WireFormat::AnthropicMessages.into(),
@@ -493,30 +694,36 @@ fn decode_anthropic_content_block(
     })
 }
 
-// Converts Anthropic tool-result content into text-like IR blocks.
+// Preserves supported Anthropic tool-result blocks in the neutral IR.
 fn decode_tool_result_content(value: &Value) -> Vec<ContentBlock> {
     match value {
         Value::String(text) => vec![ContentBlock::Text { text: text.clone() }],
         Value::Array(blocks) => {
-            let mut text = Vec::new();
+            let mut content = Vec::new();
             for block in blocks {
                 if let Some(block) = block.as_object() {
-                    if block.get("type").and_then(Value::as_str) == Some("text") {
-                        text.push(
-                            block
+                    match block.get("type").and_then(Value::as_str) {
+                        Some("text") => content.push(ContentBlock::Text {
+                            text: block
                                 .get("text")
                                 .and_then(Value::as_str)
                                 .unwrap_or_default()
                                 .to_string(),
-                        );
-                    } else {
-                        text.push(json_string(&Value::Object(block.clone())));
+                        }),
+                        Some("image") => content.push(ContentBlock::Image {
+                            source: ImageSource::Raw(Value::Object(block.clone())),
+                        }),
+                        Some("document") => content.push(ContentBlock::File {
+                            source: decode_anthropic_file_source(block),
+                        }),
+                        _ => content.push(ContentBlock::Unknown {
+                            provider: WireFormat::AnthropicMessages.into(),
+                            raw: Value::Object(block.clone()),
+                        }),
                     }
                 }
             }
-            vec![ContentBlock::Text {
-                text: text.join(" "),
-            }]
+            content
         }
         Value::Null => vec![ContentBlock::Text {
             text: String::new(),
@@ -525,6 +732,11 @@ fn decode_tool_result_content(value: &Value) -> Vec<ContentBlock> {
             text: json_string(other),
         }],
     }
+}
+
+// Keeps Anthropic document fields together for same-format re-encoding.
+fn decode_anthropic_file_source(block: &Map<String, Value>) -> FileSource {
+    FileSource::Raw(Value::Object(block.clone()))
 }
 
 // Decodes Anthropic tool definitions into normalized tool definitions.
@@ -546,7 +758,7 @@ fn decode_anthropic_tools(value: Option<&Value>) -> Vec<ToolDefinition> {
                     .get("input_schema")
                     .cloned()
                     .unwrap_or_else(|| json!({})),
-                strict: None,
+                strict: tool.get("strict").and_then(Value::as_bool),
             })
         })
         .collect()
@@ -667,8 +879,10 @@ fn encode_anthropic_content_with_policy(
 ) -> Result<Vec<Value>> {
     let mut blocks = Vec::new();
     for block in content {
+        crate::codecs::openai_media::validate_media(block, WireFormat::AnthropicMessages)?;
         match block {
-            ContentBlock::Unknown { raw, .. } => {
+            ContentBlock::Unknown { provider, raw } => {
+                reject_responses_builtin_tool_item(provider, raw, WireFormat::AnthropicMessages)?;
                 push_lossy(
                     diagnostics,
                     policy,
@@ -676,7 +890,7 @@ fn encode_anthropic_content_with_policy(
                 )?;
                 blocks.push(json!({"type": "text", "text": json_string(raw)}));
             }
-            other => blocks.extend(encode_one_anthropic_block(other)),
+            other => blocks.extend(encode_one_anthropic_block(other)?),
         }
     }
     if blocks.is_empty() {
@@ -685,42 +899,98 @@ fn encode_anthropic_content_with_policy(
     Ok(blocks)
 }
 
+fn encode_anthropic_file(source: &FileSource) -> Result<Value> {
+    match source {
+        FileSource::FileData { data, filename } => {
+            let (media_type, data) = split_base64_data_uri(data)
+                .unwrap_or_else(|| (document_media_type(filename.as_deref()), data.as_str()));
+            let source = match media_type {
+                "text/plain" => {
+                    let bytes =
+                        STANDARD
+                            .decode(data)
+                            .map_err(|_| TranslationError::InvalidValue {
+                                path: "file_data".into(),
+                                message: "invalid base64 text document".into(),
+                            })?;
+                    let text =
+                        String::from_utf8(bytes).map_err(|_| TranslationError::InvalidValue {
+                            path: "file_data".into(),
+                            message: "text document must be UTF-8".into(),
+                        })?;
+                    json!({"type": "text", "media_type": media_type, "data": text})
+                }
+                "application/pdf" => {
+                    json!({"type": "base64", "media_type": media_type, "data": data})
+                }
+                _ => {
+                    return Err(TranslationError::LossyConversion(
+                        "Anthropic requires PDF or plain-text documents".into(),
+                    ));
+                }
+            };
+            let mut block = json!({"type": "document", "source": source});
+            if let Some(filename) = filename {
+                block["title"] = filename.clone().into();
+            }
+            Ok(block)
+        }
+        FileSource::Raw(raw) if raw.get("type").and_then(Value::as_str) == Some("input_file") => {
+            let url = raw.get("file_url").and_then(Value::as_str).ok_or_else(|| {
+                TranslationError::LossyConversion("unsupported Anthropic document source".into())
+            })?;
+            let mut block = json!({"type": "document", "source": {"type": "url", "url": url}});
+            if let Some(filename) = raw.get("filename") {
+                block["title"] = filename.clone();
+            }
+            Ok(block)
+        }
+        FileSource::Raw(raw) => Ok(raw.clone()),
+        FileSource::FileId(file_id) => Ok(json!({
+            "type": "document", "source": {"type": "file", "file_id": file_id}
+        })),
+    }
+}
+
 // Encodes content without producing diagnostics for response paths.
-fn encode_anthropic_content(content: &[ContentBlock]) -> Vec<Value> {
-    let mut blocks = content
-        .iter()
-        .flat_map(encode_one_anthropic_response_block)
-        .collect::<Vec<_>>();
+fn encode_anthropic_content(content: &[ContentBlock]) -> Result<Vec<Value>> {
+    let mut blocks = Vec::new();
+    for block in content {
+        crate::codecs::openai_media::validate_media(block, WireFormat::AnthropicMessages)?;
+        blocks.extend(encode_one_anthropic_response_block(block)?);
+    }
     if blocks.is_empty() {
         blocks.push(json!({"type": "text", "text": ""}));
     }
-    blocks
+    Ok(blocks)
 }
 
 // Encodes response content, where synthetic reasoning may be shown to clients.
-fn encode_one_anthropic_response_block(block: &ContentBlock) -> Vec<Value> {
+fn encode_one_anthropic_response_block(block: &ContentBlock) -> Result<Vec<Value>> {
     match block {
         ContentBlock::Reasoning {
             text,
             signature: None,
-        } => vec![json!({
+            ..
+        } => Ok(vec![json!({
             "type": "thinking",
             "thinking": text,
             "signature": "",
-        })],
+        })]),
         other => encode_one_anthropic_block(other),
     }
 }
 
 // Encodes a single normalized content block into Anthropic block JSON.
-fn encode_one_anthropic_block(block: &ContentBlock) -> Vec<Value> {
-    match block {
+fn encode_one_anthropic_block(block: &ContentBlock) -> Result<Vec<Value>> {
+    Ok(match block {
         ContentBlock::Text { text } | ContentBlock::Refusal { text } => {
             vec![json!({"type": "text", "text": text})]
         }
         ContentBlock::Reasoning {
             text,
             signature: Some(signature),
+            ..
         } if !signature.is_empty() => vec![json!({
             "type": "thinking",
             "thinking": text,
@@ -733,15 +1003,39 @@ fn encode_one_anthropic_block(block: &ContentBlock) -> Vec<Value> {
             "name": call.name,
             "input": anthropic_tool_input(&call.arguments),
         })],
-        ContentBlock::ToolResult(result) => vec![json!({
-            "type": "tool_result",
-            "tool_use_id": sanitize_anthropic_tool_use_id(&result.tool_call_id),
-            "content": text_from_blocks(&result.content, " "),
-        })],
-        ContentBlock::Image { source } => vec![match source {
-            ImageSource::Url { url, .. } => {
-                json!({"type": "image", "source": {"type": "url", "url": url}})
+        ContentBlock::ToolResult(result) => {
+            let content = if result.content.iter().all(|block| {
+                matches!(
+                    block,
+                    ContentBlock::Text { .. } | ContentBlock::Refusal { .. }
+                )
+            }) {
+                Value::String(text_from_blocks(&result.content, " "))
+            } else {
+                let mut content = Vec::new();
+                for block in &result.content {
+                    content.extend(encode_one_anthropic_tool_result_block(block)?);
+                }
+                Value::Array(content)
+            };
+            let mut item = json!({
+                "type": "tool_result",
+                "tool_use_id": sanitize_anthropic_tool_use_id(&result.tool_call_id),
+                "content": content,
+            });
+            if let Some(is_error) = result.is_error {
+                item["is_error"] = Value::Bool(is_error);
             }
+            vec![item]
+        }
+        ContentBlock::Image { source } => vec![match source {
+            ImageSource::Url { url, .. } => match split_base64_data_uri(url) {
+                Some((media_type, data)) => json!({
+                    "type": "image",
+                    "source": {"type": "base64", "media_type": media_type, "data": data},
+                }),
+                None => json!({"type": "image", "source": {"type": "url", "url": url}}),
+            },
             ImageSource::Base64 { media_type, data } => json!({
                 "type": "image",
                 "source": {
@@ -752,20 +1046,7 @@ fn encode_one_anthropic_block(block: &ContentBlock) -> Vec<Value> {
             }),
             ImageSource::Raw(raw) => raw.clone(),
         }],
-        ContentBlock::File { source } => vec![match source {
-            FileSource::FileId(file_id) => {
-                json!({"type": "document", "source": {"type": "file", "file_id": file_id}})
-            }
-            FileSource::FileData { data, filename } => json!({
-                "type": "document",
-                "source": {
-                    "type": "base64",
-                    "data": data,
-                    "filename": filename,
-                },
-            }),
-            FileSource::Raw(raw) => raw.clone(),
-        }],
+        ContentBlock::File { source } => vec![encode_anthropic_file(source)?],
         ContentBlock::Audio { source } => vec![match source {
             MediaSource::Url { url, media_type } => {
                 json!({"type": "audio", "source": {"type": "url", "url": url, "media_type": media_type}})
@@ -795,7 +1076,60 @@ fn encode_one_anthropic_block(block: &ContentBlock) -> Vec<Value> {
             MediaSource::Raw(raw) => raw.clone(),
         }],
         ContentBlock::Unknown { raw, .. } => vec![raw.clone()],
+    })
+}
+
+// Encodes only provider-safe block shapes inside Anthropic tool results.
+fn encode_one_anthropic_tool_result_block(block: &ContentBlock) -> Result<Vec<Value>> {
+    match block {
+        ContentBlock::Text { .. }
+        | ContentBlock::Refusal { .. }
+        | ContentBlock::Image { .. }
+        | ContentBlock::File { .. } => encode_one_anthropic_block(block),
+        ContentBlock::Unknown { provider, raw }
+            if provider.as_str() == WireFormat::AnthropicMessages.as_str() =>
+        {
+            Ok(vec![raw.clone()])
+        }
+        ContentBlock::Unknown { raw, .. } => {
+            Ok(vec![json!({"type": "text", "text": json_string(raw)})])
+        }
+        ContentBlock::Reasoning { .. }
+        | ContentBlock::Audio { .. }
+        | ContentBlock::Video { .. }
+        | ContentBlock::ToolCall(_)
+        | ContentBlock::ToolResult(_) => Ok(Vec::new()),
     }
+}
+
+// Anthropic accepts PDF and plain-text documents; a file with no media type is a PDF
+// unless its name says otherwise.
+fn document_media_type(filename: Option<&str>) -> &'static str {
+    match filename
+        .and_then(|name| name.rsplit_once('.'))
+        .map(|(_, ext)| ext)
+    {
+        Some(ext) if ext.eq_ignore_ascii_case("txt") || ext.eq_ignore_ascii_case("md") => {
+            "text/plain"
+        }
+        _ => "application/pdf",
+    }
+}
+
+// Splits `data:<media type>[;<parameter>...];base64,<payload>`, the form OpenAI-compatible
+// clients use for inline images. A percent-encoded payload has to be decoded before it is
+// base64, and a data URI with no media type leaves Anthropic's `media_type` with nothing to
+// carry, so both keep the handling they had before and are relayed as-is.
+fn split_base64_data_uri(url: &str) -> Option<(&str, &str)> {
+    let (metadata, data) = url.strip_prefix("data:")?.split_once(',')?;
+    let parameters = metadata.strip_suffix(";base64")?;
+    let media_type = parameters
+        .split_once(';')
+        .map_or(parameters, |(media_type, _)| media_type);
+    if media_type.is_empty() || data.contains('%') {
+        return None;
+    }
+    Some((media_type, data))
 }
 
 // Anthropic requires `tool_use.input` to be object-shaped, while OpenAI and
@@ -826,11 +1160,15 @@ fn encode_anthropic_tools(tools: &[ToolDefinition]) -> Value {
         tools
             .iter()
             .map(|tool| {
-                json!({
+                let mut item = json!({
                     "name": tool.name,
                     "description": tool.description.clone().unwrap_or_default(),
                     "input_schema": tool.parameters,
-                })
+                });
+                if let Some(strict) = tool.strict {
+                    item["strict"] = Value::Bool(strict);
+                }
+                item
             })
             .collect(),
     )
@@ -853,26 +1191,46 @@ fn decode_anthropic_usage(value: Option<&Value>) -> Usage {
         return Usage::default();
     };
     let input_tokens = value.get("input_tokens").and_then(Value::as_u64);
+    let cached_input_tokens = value.get("cache_read_input_tokens").and_then(Value::as_u64);
+    let cache_creation_input_tokens = value
+        .get("cache_creation_input_tokens")
+        .and_then(Value::as_u64);
     let output_tokens = value.get("output_tokens").and_then(Value::as_u64);
     Usage {
         input_tokens,
+        cache: Usage::cache_details(cached_input_tokens, cache_creation_input_tokens),
         output_tokens,
-        total_tokens: input_tokens
-            .zip(output_tokens)
-            .map(|(input, output)| input + output),
-        reasoning_tokens: value
-            .get("output_tokens_details")
-            .and_then(|details| details.get("reasoning_tokens"))
-            .and_then(Value::as_u64),
+        total_tokens: input_tokens.zip(output_tokens).map(|(input, output)| {
+            input
+                + cached_input_tokens.unwrap_or(0)
+                + cache_creation_input_tokens.unwrap_or(0)
+                + output
+        }),
+        reasoning_tokens: value.get("output_tokens_details").and_then(|details| {
+            details
+                .get("thinking_tokens")
+                .and_then(Value::as_u64)
+                .or_else(|| details.get("reasoning_tokens").and_then(Value::as_u64))
+        }),
     }
 }
 
 // Encodes normalized usage into Anthropic usage JSON.
 fn encode_anthropic_usage(usage: &Usage) -> Value {
-    json!({
+    let mut value = json!({
         "input_tokens": usage.input_tokens.unwrap_or(0),
         "output_tokens": usage.output_tokens.unwrap_or(0),
-    })
+    });
+    if let Some(cached_tokens) = usage.cached_input_tokens() {
+        value["cache_read_input_tokens"] = json!(cached_tokens);
+    }
+    if let Some(cache_creation_tokens) = usage.cache_creation_input_tokens() {
+        value["cache_creation_input_tokens"] = json!(cache_creation_tokens);
+    }
+    if let Some(thinking_tokens) = usage.reasoning_tokens {
+        value["output_tokens_details"] = json!({"thinking_tokens": thinking_tokens});
+    }
+    value
 }
 
 // Maps Anthropic stop reasons to normalized stop reasons.
@@ -880,6 +1238,7 @@ fn map_anthropic_stop_reason(reason: Option<&str>) -> StopReason {
     match reason {
         Some("max_tokens") => StopReason::MaxTokens,
         Some("tool_use") => StopReason::ToolUse,
+        Some("refusal") => StopReason::ContentFilter,
         Some("end_turn") | None => StopReason::EndTurn,
         _ => StopReason::Unknown,
     }
@@ -890,9 +1249,30 @@ fn anthropic_stop_reason(reason: StopReason) -> &'static str {
     match reason {
         StopReason::MaxTokens => "max_tokens",
         StopReason::ToolUse => "tool_use",
-        StopReason::EndTurn
-        | StopReason::ContentFilter
-        | StopReason::Error
-        | StopReason::Unknown => "end_turn",
+        StopReason::ContentFilter => "refusal",
+        StopReason::EndTurn | StopReason::Error | StopReason::Unknown => "end_turn",
+    }
+}
+
+// Emits the metadata object Anthropic pairs with a `refusal` stop reason.
+//
+// An Anthropic source keeps its `stop_details` in provider extensions, so replay that
+// object and preserve the named policy category and its explanation. Only a refusal
+// synthesized from a provider that reports no category falls back to the null form,
+// which Anthropic documents as the normal value for a refusal that maps to no named
+// category.
+fn anthropic_stop_details(reason: StopReason, source: Option<&Value>) -> Value {
+    match reason {
+        StopReason::ContentFilter => source
+            .filter(|details| !details.is_null())
+            .cloned()
+            .unwrap_or_else(|| {
+                json!({
+                    "type": "refusal",
+                    "category": Value::Null,
+                    "explanation": Value::Null,
+                })
+            }),
+        _ => Value::Null,
     }
 }

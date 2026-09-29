@@ -5,12 +5,14 @@
 
 use std::collections::BTreeMap;
 
-use serde_json::{json, Map, Value};
+use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+use serde_json::{Map, Value, json};
+use switchyard_protocol::ModelId;
 
 use crate::diagnostic::TranslationDiagnostic;
 use crate::error::{Result, TranslationError};
-use crate::format::FormatId;
-use crate::ir::{ContentBlock, ConversationRequest, Message, PreservationMetadata};
+use crate::format::{FormatId, WireFormat};
+use crate::llm::{ContentBlock, InstructionBlock, LlmRequest, Message, PreservationMetadata, Role};
 use crate::policy::{
     LossyConversionPolicy, PreservationPolicy, TranslationPolicy, UnknownFieldPolicy,
 };
@@ -19,6 +21,8 @@ use crate::policy::{
 pub const SWITCHYARD_METADATA_KEY: &str = "_switchyard_translation";
 /// Public alias for the embedded preservation metadata key.
 pub const PRESERVATION_METADATA_KEY: &str = SWITCHYARD_METADATA_KEY;
+
+const ANTHROPIC_TOOL_ID_ENCODING_PREFIX: &str = "sy64_";
 
 /// Reads a JSON object or returns a typed translation error at the given path.
 pub fn object<'a>(value: &'a Value, path: &str) -> Result<&'a Map<String, Value>> {
@@ -95,6 +99,38 @@ pub fn push_lossy(
     }
 }
 
+// These Responses history items are valid only as top-level `input` items.
+pub(crate) fn is_responses_builtin_tool_item(item: &Value) -> bool {
+    matches!(
+        item.get("type").and_then(Value::as_str),
+        Some(
+            "apply_patch_call"
+                | "apply_patch_call_output"
+                | "shell_call"
+                | "shell_call_output"
+                | "computer_call"
+                | "computer_call_output"
+        )
+    )
+}
+
+// Prevent provider-specific tool history from being downgraded to target-visible prose.
+pub(crate) fn reject_responses_builtin_tool_item(
+    provider: &FormatId,
+    item: &Value,
+    target: WireFormat,
+) -> Result<()> {
+    if provider.as_str() == WireFormat::OpenAiResponses.as_str()
+        && is_responses_builtin_tool_item(item)
+    {
+        return Err(TranslationError::UnsupportedTranslation {
+            from: WireFormat::OpenAiResponses.into(),
+            to: target.into(),
+        });
+    }
+    Ok(())
+}
+
 /// Generates a stable, human-readable ID from a prefix and counter.
 pub fn stable_id(prefix: &str, counter: usize) -> String {
     format!("{prefix}_{counter:08}")
@@ -122,7 +158,7 @@ pub fn compact_text_blocks<'a>(
 
 /// Checks a request against declared target capabilities.
 pub fn validate_request_capabilities(
-    request: &ConversationRequest,
+    request: &LlmRequest,
     diagnostics: &mut Vec<TranslationDiagnostic>,
     policy: &TranslationPolicy,
 ) -> Result<()> {
@@ -214,11 +250,27 @@ fn messages_have_tools(messages: &[Message]) -> bool {
 }
 
 // Scans message content for a caller-provided block predicate.
-fn messages_have_block(messages: &[Message], predicate: impl FnMut(&ContentBlock) -> bool) -> bool {
+fn messages_have_block(
+    messages: &[Message],
+    mut predicate: impl FnMut(&ContentBlock) -> bool,
+) -> bool {
     messages
         .iter()
-        .flat_map(|message| message.content.iter())
-        .any(predicate)
+        .any(|message| content_has_block(&message.content, &mut predicate))
+}
+
+// Scans content recursively because tool results can contain media blocks.
+fn content_has_block(
+    content: &[ContentBlock],
+    predicate: &mut impl FnMut(&ContentBlock) -> bool,
+) -> bool {
+    content.iter().any(|block| {
+        predicate(block)
+            || match block {
+                ContentBlock::ToolResult(result) => content_has_block(&result.content, predicate),
+                _ => false,
+            }
+    })
 }
 
 /// Captures an exact source request body according to preservation policy.
@@ -269,6 +321,120 @@ pub fn exact_preserved_response(
     (policy.preservation != PreservationPolicy::Disabled)
         .then(|| preservation.responses.get(&format).cloned())
         .flatten()
+}
+
+/// Applies a selected target model and optionally prepends its system prompt.
+///
+/// Preserved built-in bodies are updated in their native format when possible so exact replay
+/// keeps caller fields that are not represented in the normalized request.
+/// Call this once per candidate using a request that has not already received a target prompt.
+pub fn prepare_request_for_target(
+    request: &mut LlmRequest,
+    target: &ModelId,
+    prompt: Option<&str>,
+) {
+    let target = target.to_string();
+    request.model = Some(target.clone());
+    if let Some(prompt) = prompt {
+        request.instructions.insert(
+            0,
+            InstructionBlock {
+                role: Role::System,
+                content: vec![ContentBlock::Text {
+                    text: prompt.to_string(),
+                }],
+            },
+        );
+    }
+    prepare_preserved_requests(&mut request.preservation, &target, prompt);
+}
+
+// Retains exact replay only where the built-in wire body can receive the target changes safely.
+fn prepare_preserved_requests(
+    preservation: &mut PreservationMetadata,
+    target: &str,
+    prompt: Option<&str>,
+) {
+    preservation.requests.retain(|format, body| {
+        let is_builtin = format.as_str() == WireFormat::OpenAiChat.as_str()
+            || format.as_str() == WireFormat::OpenAiResponses.as_str()
+            || format.as_str() == WireFormat::AnthropicMessages.as_str();
+        let Some(body) = is_builtin.then_some(body).and_then(Value::as_object_mut) else {
+            return false;
+        };
+        body.insert("model".to_string(), Value::String(target.to_string()));
+        match prompt {
+            None => true,
+            Some(prompt) if format.as_str() == WireFormat::OpenAiChat.as_str() => {
+                prepend_openai_chat_system(body, prompt)
+            }
+            Some(prompt) if format.as_str() == WireFormat::OpenAiResponses.as_str() => {
+                prepend_openai_responses_instructions(body, prompt)
+            }
+            Some(prompt) if format.as_str() == WireFormat::AnthropicMessages.as_str() => {
+                body.remove(crate::codecs::common::ANTHROPIC_REQUEST_KEY);
+                prepend_anthropic_system(body, prompt)
+            }
+            Some(_) => false,
+        }
+    });
+}
+
+// Prepends a target prompt without rebuilding or otherwise changing a Chat request.
+fn prepend_openai_chat_system(body: &mut Map<String, Value>, prompt: &str) -> bool {
+    let message = json!({"role": "system", "content": prompt});
+    match body.get_mut("messages") {
+        None | Some(Value::Null) => {
+            body.insert("messages".to_string(), Value::Array(vec![message]));
+        }
+        Some(Value::Array(messages)) => messages.insert(0, message),
+        Some(_) => return false,
+    }
+    true
+}
+
+// Prepends a target prompt without rebuilding or otherwise changing a Responses request.
+fn prepend_openai_responses_instructions(body: &mut Map<String, Value>, prompt: &str) -> bool {
+    match body.get_mut("instructions") {
+        None | Some(Value::Null) => {
+            body.insert(
+                "instructions".to_string(),
+                Value::String(prompt.to_string()),
+            );
+        }
+        Some(Value::String(instructions)) if instructions.is_empty() => {
+            *instructions = prompt.to_string();
+        }
+        Some(Value::String(instructions)) => {
+            instructions.insert_str(0, &format!("{prompt}\n\n"));
+        }
+        Some(_) => return false,
+    }
+    true
+}
+
+// Prepends a target prompt without rebuilding or otherwise changing an Anthropic request.
+fn prepend_anthropic_system(body: &mut Map<String, Value>, prompt: &str) -> bool {
+    match body.get_mut("system") {
+        None | Some(Value::Null) => {
+            body.insert("system".to_string(), Value::String(prompt.to_string()));
+        }
+        Some(Value::String(system)) if system.is_empty() => {
+            *system = prompt.to_string();
+        }
+        Some(Value::String(system)) => {
+            system.insert_str(0, &format!("{prompt}\n\n"));
+        }
+        Some(Value::Array(blocks)) => blocks.insert(
+            0,
+            json!({
+                "type": "text",
+                "text": prompt,
+            }),
+        ),
+        Some(_) => return false,
+    }
+    true
 }
 
 /// Embeds preservation metadata into a translated wire body when requested.
@@ -327,23 +493,33 @@ pub fn normalize_anthropic_tool_use_ids(value: Value) -> Value {
     }
 }
 
-/// Converts a single ID into Anthropic-safe characters.
+/// Converts an ID into a reversible Anthropic-safe representation.
 pub fn sanitize_anthropic_tool_use_id(raw: &str) -> String {
-    let sanitized = raw
-        .chars()
-        .map(|ch| {
-            if ch.is_ascii_alphanumeric() || ch == '_' || ch == '-' {
-                ch
-            } else {
-                '_'
-            }
-        })
-        .collect::<String>();
-    if sanitized.is_empty() {
-        "toolu_empty".to_string()
-    } else {
-        sanitized
+    let is_safe = !raw.is_empty()
+        && raw
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-');
+    if is_safe && !raw.starts_with(ANTHROPIC_TOOL_ID_ENCODING_PREFIX) {
+        return raw.to_string();
     }
+
+    format!(
+        "{ANTHROPIC_TOOL_ID_ENCODING_PREFIX}{}",
+        URL_SAFE_NO_PAD.encode(raw.as_bytes())
+    )
+}
+
+/// Restores an ID encoded by [`sanitize_anthropic_tool_use_id`].
+pub(crate) fn desanitize_anthropic_tool_use_id(encoded: &str) -> String {
+    let Some(payload) = encoded.strip_prefix(ANTHROPIC_TOOL_ID_ENCODING_PREFIX) else {
+        return encoded.to_string();
+    };
+
+    URL_SAFE_NO_PAD
+        .decode(payload)
+        .ok()
+        .and_then(|bytes| String::from_utf8(bytes).ok())
+        .unwrap_or_else(|| encoded.to_string())
 }
 
 // Normalizes every content block in one Anthropic message.
@@ -422,10 +598,10 @@ fn mapped_tool_id(
         return existing.clone();
     }
     let mut candidate = sanitize_anthropic_tool_use_id(raw);
-    if let Some(owner) = used_ids.get(&candidate) {
-        if owner != raw {
-            candidate = format!("{}_{}", candidate, stable_suffix(raw));
-        }
+    if let Some(owner) = used_ids.get(&candidate)
+        && owner != raw
+    {
+        candidate = format!("{}_{}", candidate, stable_suffix(raw));
     }
     id_map.insert(raw.to_string(), candidate.clone());
     used_ids.insert(candidate.clone(), raw.to_string());
@@ -440,4 +616,38 @@ fn stable_suffix(raw: &str) -> String {
         hash = hash.wrapping_mul(1099511628211);
     }
     format!("{hash:08x}")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{desanitize_anthropic_tool_use_id, sanitize_anthropic_tool_use_id};
+
+    // Keeps ordinary provider IDs unchanged while making unsafe IDs reversible.
+    #[test]
+    fn anthropic_tool_id_encoding_round_trips() {
+        assert_eq!(
+            sanitize_anthropic_tool_use_id("call_abc-123"),
+            "call_abc-123"
+        );
+
+        for raw in ["", "functions.list_skills:0", "工具/lookup"] {
+            let encoded = sanitize_anthropic_tool_use_id(raw);
+            assert!(
+                encoded
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-')
+            );
+            assert_eq!(desanitize_anthropic_tool_use_id(&encoded), raw);
+        }
+    }
+
+    // Escapes the reserved prefix and leaves malformed encoded values untouched.
+    #[test]
+    fn anthropic_tool_id_encoding_disambiguates_its_prefix() {
+        let raw = "sy64_Zm9v";
+        let encoded = sanitize_anthropic_tool_use_id(raw);
+        assert_ne!(encoded, raw);
+        assert_eq!(desanitize_anthropic_tool_use_id(&encoded), raw);
+        assert_eq!(desanitize_anthropic_tool_use_id("sy64_%%%"), "sy64_%%%");
+    }
 }

@@ -40,51 +40,26 @@ request signals, or conversation affinity. See the
 
 ## Backend Wire Format
 
-`BackendFormat` controls the upstream endpoint Switchyard calls. Explicit
-formats select an endpoint directly and do not run capability probes.
+Each LLM client in the deployment file sets `format`. It fixes the upstream
+endpoint and wire format for every target that uses that client.
 
-| Format | Upstream behavior | Use when |
-|---|---|---|
-| `ANTHROPIC` | Always sends to `/v1/messages`. No probe. | You know the upstream is Anthropic-native (Anthropic API, NIM Claude routes). |
-| `RESPONSES` | Always sends to `/v1/responses`. No probe. | You know the upstream supports the OpenAI Responses API. Fails on NIM / non-OpenAI upstreams. |
-| `OPENAI` | Always sends to `/v1/chat/completions`. No probe. | You know the upstream is OpenAI-compatible (NIM, OpenRouter, etc). Safe universal choice. |
-| `AUTO` | Probes at startup, picks best format (see below). | Upstream is unknown or varies across deployments. Used by Claude Code and Codex launchers. OpenClaw is intentionally pinned to `OPENAI`. |
-| *(omitted)* | Defaults to `OPENAI` — no probe, no fast-path. Silently uses Chat Completions, which is wrong for Anthropic/Bedrock models. Always set `format:` explicitly. |  |
-Claude Code and Codex launchers use `AUTO` for their single-model targets.
-OpenClaw is intentionally pinned to `OPENAI` for its equivalent target.
+| `format` | Upstream endpoint |
+|---|---|
+| `openai_chat` | `/v1/chat/completions` |
+| `openai_responses` | `/v1/responses` |
+| `anthropic_messages` | `/v1/messages` |
 
-### AUTO Decision Tree
+`format` is required. Switchyard does not probe upstreams or select a format
+automatically.
 
-```mermaid
-flowchart TB
-    auto["BackendFormat.AUTO"]
-    messages{"/v1/messages works?"}
-    anthropic["ANTHROPIC<br/>/v1/messages"]
-    responses{"/v1/responses works?"}
-    responses_format["RESPONSES<br/>/v1/responses"]
-    openai["OPENAI<br/>/v1/chat/completions fallback"]
+Switchyard decodes every inbound request into provider-neutral types before
+routing, then encodes it for the selected target's format.
+`switchyard-translation` converts requests, buffered responses, and streaming
+events between these formats, so Claude Code, Codex, OpenClaw, and SDK clients
+keep their native wire format regardless of the upstream a route selects.
 
-    auto -->|"Probe /v1/messages"| messages
-    messages -->|"Yes"| anthropic
-    messages -->|"No: probe /v1/responses"| responses
-    responses -->|"Yes"| responses_format
-    responses -->|"No"| openai
-```
-
-Supported inbound and response formats are handled automatically.
-`TranslationEngine` converts the client's request to the resolved backend
-format and translates the backend response back to the client's expected
-format. When a cross-format conversion is required, both directions decode to
-and re-encode from the neutral conversation IR. This lets Claude Code, Codex,
-OpenClaw, and SDK clients use their native wire format with any supported
-upstream format.
-
-> Prefer an explicit format for controlled deployments. It skips capability
-> probes and makes the upstream contract clear. Use `AUTO` when provider
-> capabilities are unknown or vary across deployments.
 ## Related Documentation
 
 - [Getting Started](getting_started.md): install Switchyard and run a first request
-- [Agent Launchers](guides/agent_launchers.md): run coding agents through a local proxy
 - [Routing Overview](routing_algorithms/overview.md): choose and configure a routing strategy
-- [CLI Reference](cli_reference.md): configure and operate Switchyard from the command line
+- [Server CLI Reference](cli_reference.md): configure and operate the standalone server

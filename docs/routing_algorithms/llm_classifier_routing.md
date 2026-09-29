@@ -1,124 +1,332 @@
 # LLM Classifier Routing
 
-LLM classifier routing asks a classifier model to evaluate each request, then
-sends the request to a `weak` or `strong` backend. Use it when routing should
-depend on request content, tool use, context needs, or risk level instead of a
-fixed traffic split.
+**Task** routing uses the LLM classifier's `capability` mode to judge whether
+an efficient model can handle the task or a capable model is needed. Configure
+it with `type = "llm_classifier"` and `mode = "capability"`.
 
-The classifier runs before the selected backend. Low-confidence and abstained
-results use the configured default tier. Classifier errors do the same when
-`classifier_fail_open` is enabled, which is the default. The built-in two-tier
-policies default to `strong`.
+The same classifier also supports [escalation](escalation_router_routing.md)
+and [custom routing](#custom-multi-target-routing) across two or more targets.
 
-## Choose a policy
+## Configure a classifier route
 
-Set `profile_name` for the traffic you expect:
+This example uses the packaged classifier prompt as intended: it estimates
+whether the weak target can complete the task, and keeps the first routing
+decision for later requests in the same conversation.
 
-| `profile_name` | Use for | Default tier mapping |
+```toml
+schema_version = 1
+
+[llm_clients.openrouter]
+format = "openai_chat"
+base_url = "https://openrouter.ai/api/v1"
+api_key_env = "OPENROUTER_API_KEY"
+
+[targets.classifier]
+id = "openai/gpt-4o-mini"
+llm_client = "openrouter"
+
+[targets.strong]
+id = "openai/gpt-4o"
+llm_client = "openrouter"
+
+[targets.weak]
+id = "z-ai/glm-5.2"
+llm_client = "openrouter"
+
+[routes.smart]
+id = "smart"
+type = "llm_classifier"
+mode = "capability"
+classifier_target = "classifier"
+strong_target = "strong"
+weak_target = "weak"
+base_threshold = 0.5
+threshold_step = 0.1
+classify_trigger = "new_session"
+message_hash_fallback = true
+```
+
+`message_hash_fallback` is best-effort: independent sessions with the same
+first user message share an affinity key. Prefer an explicit
+`x-switchyard-session-id` when repeated opening prompts are possible.
+
+The target table names are local references. Their `id` values are the model
+identifiers sent to the upstream provider. The route's `id`, `smart`, is the
+model name clients send to Switchyard.
+
+## How the decision works
+
+The classifier target returns a structured verdict containing:
+
+- `p_solve`: the estimated probability that the weak model completes the task.
+- `capability_boundary`: `supported`, `uncertain`, `unsupported`, or `unmatched`.
+- `primary_rule`: the capability-card rule that determines the boundary.
+- `crux`: the hardest material requirement for whole-task success.
+
+For a usable verdict, Switchyard routes to `weak_target` when `p_solve` is
+greater than or equal to the applicable threshold. Otherwise it routes to
+`strong_target`:
+
+- `supported` uses `base_threshold`.
+- `uncertain` and `unmatched` use `base_threshold + threshold_step`.
+- `unsupported` uses `base_threshold + 2 * threshold_step`.
+
+An invalid, inconsistent, or unparseable verdict routes to
+`strong_target`. Raising either knob sends more traffic to the strong model.
+
+To stop waiting for a judge that accepts the request but never finishes its
+response, set `timeout_ms` on the judge's `[llm_clients]` entry
+(see the [TOML schema](../reference/toml_schema.md)); it covers the judge's
+retries and the complete verdict body. When the deadline expires, the Rust server returns
+`504` without calling `strong_target` or `weak_target`. Other HTTP client failures
+also stop routing after retries. The deadline applies to every call
+through that client. Give the judge its own entry if the answering models need a
+different deadline, even when they use the same provider. Without a deadline,
+the request can wait indefinitely for the judge.
+
+## Judge model compatibility
+
+The judge must return complete, schema-valid JSON in normal assistant `content`.
+Switchyard does not parse provider-specific reasoning fields such as
+`reasoning_content`. If `content` is empty or unparseable, the route falls back
+to `strong_target` even when the judge request returned HTTP 200. With session
+affinity, that fallback can be reused without another judge call.
+
+Capability and escalation routes use JSON Schema structured output by default.
+For a provider that supports JSON Object mode but not JSON Schema, set
+`response_format_type = "json_object"` on the route. Switchyard then adds the
+verdict schema to the judge prompt and validates the returned object locally.
+
+When a vLLM-compatible provider supports `enable_thinking`, configure it on the
+judge target through `extra_body`:
+
+```toml
+[targets.classifier]
+extra_body = { chat_template_kwargs = { enable_thinking = false } }
+```
+
+`enable_thinking` is a provider-specific vLLM option, not a general requirement
+for reasoning models. Other model/provider pairs may work with reasoning enabled
+or use a different control. Verify the judge response shape before deployment.
+If reasoning remains enabled, set `max_output_tokens` high enough for both the
+reasoning and final JSON. A truncated verdict has the same fail-open result. See
+the [target-level `extra_body` reference](../../crates/switchyard-server/CONFIGURATION.md#add-an-llm-client-and-target)
+for the server merge behavior.
+
+## Tuning options
+
+| Key | Default | Meaning |
 |---|---|---|
-| `general` | Mixed chat or API traffic | `simple` uses `weak`; all higher tiers use `strong`. |
-| `coding_agent` | Claude Code, Codex, Cursor-style agents | `simple` and `medium` use `weak`; `complex` and `reasoning` use `strong`. Tool-planning turns can escalate. |
-| `openclaw` | OpenClaw personal-assistant traffic | `simple` and `medium` use `weak`; `complex` and `reasoning` use `strong`. Tool orchestration and high-risk external actions can escalate. |
+| `base_threshold` | required | Lowest `p_solve` that routes a supported task to `weak_target`. Must be between `0` and `1`. |
+| `threshold_step` | `0.0` | Amount added for each boundary step. Must be finite and non-negative, and `base_threshold + 2 * threshold_step` must not exceed `1`. |
+| `recent_turn_window` | unset | When unset, the judge sees the opening user task and the latest user message when they differ. When set to `N`, it sees the opening user task and the last `N` conversation messages after that task. `0` keeps only the opening task. Client system and developer instructions are not shown to the judge. |
+| `classify_trigger` | `every_request` | When the judge runs. `every_request` judges every request, tool continuations included. `user_turn` judges each new user message and holds that target across the tool calls between. `new_session` judges once and reuses that target for the session. |
+| `message_hash_fallback` | `false` | When session metadata is absent, keys affinity from the first user-message text. Requires `classify_trigger = "new_session"` or `"user_turn"`. |
+| `prompt` | packaged capability prompt | Replaces the classifier's system prompt. The packaged verdict schema and routing policy remain active. |
+| `response_format_type` | `json_schema` | Structured-output mode for capability and escalation judges. Use `json_object` for providers without JSON Schema support. |
+| `max_output_tokens` | `4096` | Maximum completion tokens available to the classifier verdict. Must be at least `1`. |
 
-For coding-agent traffic, start with `profile_name: coding_agent`.
+### Override the classifier prompt
 
-## Configure a classifier profile
+Set `prompt` on the route when the packaged capability rubric does not describe
+your weak model. Do not copy the response schema into the prompt: Switchyard
+supplies it according to `response_format_type`.
 
-Define the strong, weak, and classifier models as targets, then reference those
-target IDs from an `llm-routing` profile:
-
-```yaml
-endpoints:
-  openrouter:
-    api_key: ${OPENROUTER_API_KEY}
-    base_url: https://openrouter.ai/api/v1
-
-targets:
-  strong:
-    endpoint: openrouter
-    model: openai/gpt-4o
-    format: openai
-  weak:
-    endpoint: openrouter
-    model: openai/gpt-4o-mini
-    format: openai
-  classifier:
-    endpoint: openrouter
-    model: openai/gpt-4o-mini
-    format: openai
-
-profiles:
-  smart:
-    type: llm-routing
-    profile_name: coding_agent
-    strong: strong
-    weak: weak
-    classifier: classifier
-    fallback_target_on_evict: strong
-    classifier_min_confidence: 0.6
-    classifier_fail_open: true
-    classifier_recent_turn_window: 4
+```toml
+[routes.smart]
+id = "smart"
+type = "llm_classifier"
+mode = "capability"
+classifier_target = "classifier"
+strong_target = "strong"
+weak_target = "weak"
+base_threshold = 0.5
+prompt = """
+Estimate whether the weak target can complete the request.
+Return exactly one JSON object matching the response schema supplied with the request.
+"""
 ```
 
-The classifier target must use `format: openai`. Start the profile server with:
+The override changes the instructions only. The judge must still return the
+packaged `crux`, `primary_rule`, `capability_boundary`, and `p_solve` fields.
+
+## Custom multi-target routing
+
+Custom mode accepts an inner JSON Schema and a policy that reads the validated
+verdict. The policy selects one of the route's model groups, and you name those
+groups yourself, so a route can choose between as many models as you like.
+
+```toml
+[routes.smart]
+id = "smart"
+type = "llm_classifier"
+mode = "custom"
+default_target = "premium"
+prompt = """
+Choose the best group for this request.
+Return JSON matching the response schema supplied with the request.
+"""
+response_schema = '''
+{
+  "type": "object",
+  "properties": {
+    "decision": {
+      "type": "object",
+      "properties": {
+        "target": {
+          "type": "string",
+          "enum": ["fast", "balanced", "reasoning", "premium"]
+        }
+      },
+      "required": ["target"],
+      "additionalProperties": false
+    }
+  },
+  "required": ["decision"],
+  "additionalProperties": false
+}
+'''
+
+[routes.smart.models]
+judge = ["classifier"]
+fast = ["fast"]
+balanced = ["balanced"]
+reasoning = ["reasoning", "premium"]
+premium = ["premium"]
+any = ["fast", "balanced", "reasoning", "premium"]
+
+[routes.smart.policy]
+type = "target_selector"
+selector = "/decision/target"
+```
+
+The names in `models` reference existing target tables. Switchyard passes the
+schema to the provider in a strict structured-output wrapper and validates the
+returned JSON again. `jsonptr` resolves the selector against that verdict. A
+missing, non-string, or unconfigured label falls back to `default_target`, and
+`judge` is never routable.
+
+A verdict names a group, and the **first** model in that group serves the turn.
+Later entries are that group's own fallbacks: if the serving call fails, the
+client falls through the rest of the chosen group first — `reasoning` retries on
+`premium` above — and then through whatever `models.any` adds. Every group's
+targets must also appear in `models.any`; one that does not is rejected when the
+configuration loads. `models.judge` supplies the judge call's own candidates in
+order and is not a completion destination.
+
+`capable` and `efficient` are reserved names. Use them when you want a group to
+carry the tier meaning the stage and composite routers give it; otherwise any
+name works.
+
+This separation applies to every classifier mode. Prompts containing the legacy
+`{{RESPONSE_SCHEMA}}` placeholder are rejected during configuration validation.
+
+### Forecast and policy assumptions
+
+The packaged prompt forecasts whole-task success for a generic efficient agent.
+It produces a probability and capability boundary but does not choose a route.
+The deterministic policy applies `base_threshold` and `threshold_step` after
+generation.
+
+Without affinity, the runtime judges every request. By default, it sends the
+opening task and the latest user follow-up when they differ, excluding tool calls,
+tool results, and reasoning. It keeps ordinary user content from messages that
+also contain tool results. Set `recent_turn_window` when intervening conversation
+context affects the forecast.
+If a client sends only a follow-up fragment without the opening task, enable
+affinity or include the task history. Threshold tuning changes routing policy;
+it cannot recover missing task context.
+
+## When the judge runs
+
+`classify_trigger` sets how often the target is re-decided.
+
+`every_request`, the default, judges every request. In an agentic session that
+includes every tool continuation, so twenty tool steps means twenty-one
+classifications of one task, and the target can change between any two of them.
+
+`user_turn` judges each new user message and holds that target through the tool
+calls that follow:
+
+```toml
+[routes.smart]
+classify_trigger = "user_turn"
+```
+
+Tool results are the agent continuing work the user already asked for, so they
+do not re-open the decision. A failed or unusable verdict keeps the current
+target. When no target has been selected yet, the next request is judged again.
+
+`new_session` judges once and reuses that target for the rest of the session,
+including `strong_target` when it was selected as the fallback for an unusable
+verdict. There is no warmup period, and later requests skip the judge entirely.
+
+The selection is held in per-session state, so requests without a session
+identity are judged every time. Clients can send `x-switchyard-session-id`, or
+enable `message_hash_fallback` to key on the first user-message text under
+`new_session`.
+
+### Responses continuations by ID
+
+A Responses API client can continue without resending the conversation history.
+Switchyard handles state differently depending on the target API:
+
+- **Native Responses targets:** The provider stores the conversation. When answer
+  targets use different `[llm_clients]` entries, Switchyard records response and
+  conversation IDs with the model that served them, but no transcript. Classifier-only
+  clients do not count. When answer targets share one client, no local record is needed.
+  The provider's `store` value takes precedence over the request value. If it is
+  `false`, Switchyard skips the response ID but still records the conversation ID.
+- **Chat Completions or Anthropic Messages targets:** For incoming Responses
+  requests, Switchyard retains request and reply messages in memory under the
+  response ID. It restores that history on a later `previous_response_id` request.
+  This also applies when answer targets share one client. Request `store: false`
+  prevents retaining the new response and history, but does not delete earlier
+  records. This path supports `previous_response_id`, not provider conversation IDs.
+
+A request with a recorded ID returns to the model that served it without a judge
+call or fallback to another provider. This applies to every `classify_trigger`
+and to `stage_router` and `composite` routes. Tracking covers buffered replies and
+completed streams, including answers returned by `/v1/decision`. Ordinary Chat
+Completions and Anthropic Messages requests do not create Responses history.
+
+Each route keeps up to 65,536 distinct ID-to-model records per process. This
+limit counts response and conversation IDs recorded over the process's lifetime,
+not tokens or simultaneous requests. Records do not expire, and Switchyard does
+not remove older records to make room. Cross-format records also retain message
+history, so this ID limit is not a memory limit. Memory use depends on the retained
+messages as well as the number of IDs.
+
+At capacity, Switchyard logs a warning and returns the reply without retaining
+new IDs or history. Existing records remain usable, but a later continuation from
+an unrecorded ID may fail. Conflicting native Responses IDs return HTTP 409 with
+code `response_state_conflict`. If streaming headers have already been sent, the
+stream emits an error instead of changing the HTTP status.
+
+A restart removes all local records and history, and each replica has its own
+state. Unknown IDs use normal routing and can still fail at the selected provider.
+Send the full history instead of an ID to avoid relying on local continuation
+state and to keep dynamic routing across turns.
+
+## Run the route
+
+After [installing the Rust server](../getting_started.md#install-the-server), export
+the provider credential, validate the configuration, and start the release
+binary:
 
 ```bash
-switchyard serve --config profiles.yaml --port 4000
+export OPENROUTER_API_KEY="your-openrouter-key"  # pragma: allowlist secret
+switchyard-server --config routes.toml --dry-run
+switchyard-server --config routes.toml \
+  --host 127.0.0.1 --port 4000
 ```
 
-The profile ID (`smart`) is the model ID clients select for classifier-based
-routing. The target IDs remain directly selectable when a client needs to
-bypass the classifier.
-
-Try the profile with representative requests:
+Send a request using the route ID:
 
 ```bash
-# Coding task: expected to use the strong tier.
-curl -X POST http://localhost:4000/v1/chat/completions \
-  -H "Authorization: Bearer dummy" -H "Content-Type: application/json" \
-  -d '{"model":"smart","messages":[{"role":"user","content":"Plan and implement a multi-file API change."}],"max_tokens":200}'
-
-# Simple question: expected to use the weak tier.
-curl -X POST http://localhost:4000/v1/chat/completions \
-  -H "Authorization: Bearer dummy" -H "Content-Type: application/json" \
-  -d '{"model":"smart","messages":[{"role":"user","content":"What is 2+2? Reply with just the number."}],"max_tokens":50}'
+curl http://localhost:4000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{"model":"smart","messages":[{"role":"user","content":"Explain why the sky appears blue."}]}'
 ```
 
-Treat these as smoke checks, not fixed test vectors: the classifier model and
-prompt determine the verdict.
-
-## Useful options
-
-| Option | Use it when |
-|---|---|
-| `classifier_min_confidence` | Low-confidence results should use `default_tier` instead of the classifier policy. |
-| `classifier_fail_open` | Classifier errors should use `default_tier` rather than fail the client request. |
-| `classifier_recent_turn_window` | The classifier needs more or less recent conversation and tool context. |
-| `classifier_max_tokens` | You need to cap the classifier tool-call response. |
-| `alignment_min_confidence` | A classifier recommendation should only raise the policy tier above this confidence. |
-| `default_tier` | Abstain, low-confidence, and fail-open decisions should use a tier other than the default `strong`. |
-| `tier_mapping` | The four classifier policy tiers need a custom mapping to `weak` or `strong`. |
-
-For a self-hosted strong, weak, or classifier target, configure it like any
-other OpenAI-compatible endpoint. See
-[Self-hosted targets](overview.md#self-hosted-targets).
-
-## Session affinity
-
-LLM classifier routing supports optional session affinity through
-`DeterministicRoutingConfig`. Set `session_affinity: true` to share one affinity
-store between the classifier and tier selector. After any configured
-`affinity_warmup_turns`, the first confident verdict pins the tier. Later turns
-reuse that tier before classification, so they skip the classifier call;
-abstain, low-confidence, missing-signal, and fail-open decisions do not pin.
-
-The CLI currently exposes these fields on a `type: deterministic` entry in a
-`routes:` bundle loaded with `--routing-profiles`. The Rust `llm-routing`
-profile loaded by `switchyard serve --config` does not yet expose them. See
-[Session Affinity](sticky_routing.md) for YAML and
-[How session affinity composes](overview.md#how-session-affinity-composes) for
-the interaction with routing decisions.
-
-If the per-request classifier cost is too high, use
-[Cascade Routing](cascade_routing.md), which can route many turns from tool and
-agent-progress signals without an extra classifier call.
+Treat the selected target as model-dependent output, not a fixed test result.

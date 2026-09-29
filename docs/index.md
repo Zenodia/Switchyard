@@ -1,137 +1,33 @@
-# Switchyard Documentation
+# Switchyard
 
-Switchyard is a typed control plane for LLM traffic. It sits between client
-applications and model backends, translates OpenAI Chat / Anthropic Messages /
-OpenAI Responses formats, and routes each request through profile-backed chains.
+Switchyard routes and translates LLM traffic for coding agents and API clients.
+It supports OpenAI Chat Completions, OpenAI Responses, and Anthropic Messages.
 
-Use Switchyard when you want coding agents, SDK clients, or internal services to
-keep their native API shape while traffic is served by a different provider,
-split across model tiers, or selected by routing policy.
+## Choose a Path
 
-## Project Overview
+| Goal | Path | Start here |
+|---|---|---|
+| Run Switchyard as a standalone proxy for API clients | Server Path | [Build and run the Rust server](getting_started.md#server-path) |
+| Add Switchyard routing to a Rust application | Library Path | [`switchyard-libsy`](../crates/libsy/README.md) |
+| Add Switchyard routing to NeMo Relay | Native Plugin Path | [Use Switchyard with NeMo Relay](integrations/nemo_relay.md) |
+| Point the pi coding agent at the standalone proxy | Server Path | [Use Switchyard with pi](integrations/pi.md) |
+| Point Oh My Pi at the standalone proxy | Server Path | [Use Switchyard with Oh My Pi](integrations/oh_my_pi.md) |
 
-| Area | What Switchyard provides |
-|---|---|
-| Client ingress | OpenAI Chat Completions, Anthropic Messages, and OpenAI Responses compatible endpoints. |
-| Agent launchers | One-command local proxies for Claude Code, Codex, and OpenClaw. |
-| Format translation | Request and response translation between supported wire formats. |
-| Routing policies | Random splits, LLM classifier routing with optional session affinity, signal-driven cascade routing, and YAML route bundles. |
-| Operations | Request/token statistics and context-window fallback behavior. |
-| Deployment options | Local coding-agent proxy, shared HTTP service, or embedded Python runtime. |
+The Server Path builds and runs the standalone `switchyard-server` binary.
 
-At a high level, Switchyard keeps client integrations separate from model
-providers and routing policy:
+## Explore
 
-```text
-clients -> compatible API surface -> routing and resilience -> model backends
-```
+- [Core Concepts](core_concepts.md): learn the LLM client, target, and route layers
+- [Routing Algorithms](routing_algorithms/overview.md): choose how requests select a model
+- [Architecture](architecture.md): understand the proxy and library components
+- [Server CLI Reference](cli_reference.md): inspect `switchyard-server` commands and options
+- [Rust API](reference/rust_api.md): browse libsy and protocol crate documentation
+- [Context-Window Handling](operations/context_window.md): configure eviction and retry behavior
 
-For system context and request lifecycle diagrams, see
-[Architecture](architecture.md).
+## Reference
 
-## First Run
-
-```bash
-pip install "nemo-switchyard[cli,server]"
-switchyard configure
-switchyard launch claude
-```
-
-For source installs, non-interactive configuration, and a curl sanity check, use
-[Getting Started](getting_started.md).
-
-## Main Workflows
-
-<div class="grid cards" markdown>
-
-- **Run coding agents**
-
-    Launch Claude Code, Codex, or OpenClaw through a local Switchyard proxy.
-
-    [Agent Launchers](guides/agent_launchers.md)
-
-- **Configure routing**
-
-    Pick between fixed splits, classifier routing, and cascade routing, with
-    optional session affinity for classifier-driven conversations.
-
-    [Routing Overview](routing_algorithms/overview.md)
-
-- **Understand the system**
-
-    See how clients, routing policy, model backends, and operations fit
-    together.
-
-    [Architecture](architecture.md)
-
-- **Operate the proxy**
-
-    Understand context-window overflow handling and fallback behavior.
-
-    [Context-Window Handling](operations/context_window.md)
-
-</div>
-
-## Configuration Model
-
-Standalone deployments start with a profile config that separates provider
-connectivity, upstream targets, and client-facing profiles:
-
-```yaml
-endpoints:
-  openrouter:
-    api_key: ${OPENROUTER_API_KEY}
-    base_url: https://openrouter.ai/api/v1
-
-targets:
-  strong:
-    endpoint: openrouter
-    model: openai/gpt-4o
-    format: openai
-  weak:
-    endpoint: openrouter
-    model: openai/gpt-4o-mini
-    format: openai
-
-profiles:
-  smart:
-    type: random-routing
-    strong: strong
-    weak: weak
-    strong_probability: 0.3
-```
-
-Run it as a long-lived proxy. Profile and target ids appear as models on
-`GET /v1/models`, and clients select one with the request's `model` field:
-
-```bash
-switchyard serve --config profiles.yaml --port 4000
-```
-
-The deprecated `--routing-profiles` flag is retained only for launcher-owned
-legacy bundles and saved bundle paths:
-
-```bash
-switchyard --routing-profiles routes.yaml -- launch claude
-switchyard --routing-profiles routes.yaml -- configure
-```
-
-Profile ids, direct targets, legacy launcher compatibility, and persistence are
-covered in [Routing Overview](routing_algorithms/overview.md).
-
-## Routing Reference
-
-| Need | Read |
-|---|---|
-| Fixed strong/weak traffic split for baselines or A/B tests | [Random Routing](routing_algorithms/random_routing.md) |
-| Per-request strong/weak decisions from a classifier model | [LLM Classifier Routing](routing_algorithms/llm_classifier_routing.md) |
-| Signal-driven weak/strong escalation with optional classifier fallback | [Cascade Routing](routing_algorithms/cascade_routing.md) |
-| Conversation-level affinity for cache reuse | [Sticky Routing](routing_algorithms/sticky_routing.md) |
-
-## Operations and Reference
-
-| Topic | Read |
-|---|---|
-| Known limitations and workarounds for 0.1.0 | [Known Issues](known_issues.md) |
-| CLI syntax, flags, resolution rules, and environment variables | [CLI Reference](cli_reference.md) |
-| Context-window overflow retry and fallback behavior | [Context-Window Handling](operations/context_window.md) |
+- [`switchyard-server`](../crates/switchyard-server/README.md): server configuration, endpoints, and metrics
+- [`switchyard-libsy`](reference/rust_api.md#switchyard-libsy): embeddable routing algorithms
+- [`switchyard-protocol`](reference/rust_api.md#switchyard-protocol): provider-neutral API types
+- [`switchyard-translation`](../crates/switchyard-translation/README.md): protocol translation
+- [`switchyard-nemo-relay-plugin`](../crates/switchyard-nemo-relay-plugin/README.md): native plugin build and configuration

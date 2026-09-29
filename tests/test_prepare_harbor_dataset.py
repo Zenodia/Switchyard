@@ -1,13 +1,12 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-from __future__ import annotations
-
 import importlib.util
 import json
 from pathlib import Path
 from types import ModuleType
 
+import pytest
 import yaml
 
 REPO = Path(__file__).resolve().parents[1]
@@ -36,7 +35,6 @@ def _write_task(root: Path, name: str, task_toml: str, dockerfile: str | None = 
 def _prepare(
     tmp_path: Path,
     source: Path,
-    *,
     source_dataset: str = "openthoughts-tblite@2.0",
 ) -> Path:
     module = _load_generator_module()
@@ -116,6 +114,29 @@ def test_terminal_bench_2_dataset_adds_proxy_allowlist_hosts(tmp_path: Path) -> 
         assert host in manifest["closed_book"]["proxy_allowlist_hosts"]
 
 
+def test_terminal_bench_2_1_dataset_reuses_terminal_bench_2_allowlist(tmp_path: Path) -> None:
+    source = tmp_path / "source"
+    _write_task(source, "tb21-task", "[environment]\n", "FROM ubuntu:22.04\n")
+
+    output = _prepare(
+        tmp_path,
+        source,
+        source_dataset="terminal-bench/terminal-bench-2-1",
+    )
+    allowlist = (output / "tb21-task" / "environment" / "proxy" / "allowlist-base.txt").read_text()
+    manifest = json.loads((output / "switchyard_dataset_manifest.json").read_text())
+
+    for host in (
+        "archive.ubuntu.com",
+        "pypi.org",
+        "github.com",
+        "huggingface.co",
+        "download.pytorch.org",
+    ):
+        assert host in allowlist
+        assert host in manifest["closed_book"]["proxy_allowlist_hosts"]
+
+
 def test_swe_bench_pro_dataset_keeps_agent_proxy_allowlist_empty(tmp_path: Path) -> None:
     source = tmp_path / "source"
     _write_task(source, "swe-task", "[environment]\n", "FROM ubuntu:22.04\n")
@@ -164,9 +185,10 @@ def test_prebuilt_docker_image_task_becomes_derived_dockerfile(tmp_path: Path) -
     assert "docker_image" not in (task / "task.toml").read_text()
     dockerfile = (task / "environment" / "Dockerfile").read_text()
     assert dockerfile.startswith("FROM python:3.12-slim\nUSER root\n")
-    assert "@anthropic-ai/claude-code@2.1.119" in dockerfile
-    assert "@openai/codex@0.125.0" in dockerfile
-    assert "opencode-ai@1.14.31" in dockerfile
+    assert "@anthropic-ai/claude-code@2.1.211" in dockerfile
+    assert "@openai/codex@0.144.5" in dockerfile
+    assert "opencode-ai@1.18.3" in dockerfile
+    assert "@earendil-works/pi-coding-agent@0.84.3" in dockerfile
 
 
 def test_dockerfile_only_task_gets_prebake_layer(tmp_path: Path) -> None:
@@ -259,13 +281,140 @@ def test_generated_dataset_manifest_records_pins_tasks_and_digests(tmp_path: Pat
     assert manifest["source_dataset"] == "openthoughts-tblite@2.0"
     assert manifest["task_count"] == 2
     assert manifest["agent_versions"] == {
-        "CLAUDE_CODE_VERSION": "2.1.119",
-        "CODEX_VERSION": "0.125.0",
+        "CLAUDE_CODE_VERSION": "2.1.211",
+        "CODEX_VERSION": "0.144.5",
+        "HERMES_VERSION": "3c27eb6234bf91b8ceee9e9071591b31e9b148cb",
         "NODE_VERSION": "20.11.1",
-        "OPENCODE_VERSION": "1.14.31",
+        "OPENCODE_VERSION": "1.18.3",
+        "PI_VERSION": "0.84.3",
     }
     assert manifest["closed_book"]["proxy_asset_digest"].startswith("sha256:")
     assert manifest["closed_book"]["verifier_egress"] == "open-via-authenticated-proxy"
     assert {task["name"] for task in manifest["tasks"]} == {"task-a", "task-b"}
     assert all(task["dockerfile_digest"].startswith("sha256:") for task in manifest["tasks"])
     assert all(task["compose_digest"].startswith("sha256:") for task in manifest["tasks"])
+
+
+def test_generated_compose_bakes_task_id_into_proxy_env(tmp_path: Path) -> None:
+    source = tmp_path / "source"
+    _write_task(source, "task-id-check", "[environment]\n", "FROM ubuntu:22.04\n")
+
+    output = _prepare(tmp_path, source)
+    compose = yaml.safe_load(
+        (output / "task-id-check" / "environment" / "docker-compose.yaml").read_text()
+    )
+
+    proxy_env = "\n".join(compose["services"]["proxy"]["environment"])
+    assert "SWITCHYARD_TASK_ID=task-id-check" in proxy_env
+    assert "SWITCHYARD_TRIAL_DIR=${HOST_AGENT_LOGS_PATH:-}" in proxy_env
+
+def test_a_hermes_ref_that_is_not_a_commit_sha_is_rejected() -> None:
+    """Only a full commit SHA can be recorded as a pin.
+
+    The dataset manifest presents HERMES_VERSION as a reproducibility guarantee. Two
+    builds recording the same string while installing different Hermes code is worse
+    than recording nothing, so the build fails rather than asserting a pin it does not
+    have. Tags are rejected alongside branches: a tag can be deleted or repointed, so
+    it reads as immutable without being so.
+    """
+    base = {
+        "CLAUDE_CODE_VERSION": "1",
+        "CODEX_VERSION": "2",
+        "OPENCODE_VERSION": "3",
+        "PI_VERSION": "5",
+        "NODE_VERSION": "4",
+    }
+    rejected = (
+        "main",
+        "master",
+        "HEAD",
+        "v2026.8.3",
+        "release/2026.8",
+        "3c27eb6",
+        "3C27EB6234BF91B8CEEE9E9071591B31E9B148CB",
+        "3c27eb6234bf91b8ceee9e9071591b31e9b148cbb",
+    )
+    for ref in rejected:
+        with pytest.raises(SystemExit, match="commit SHA"):
+            _load_generator_module()._install_layer({**base, "HERMES_VERSION": ref})
+
+
+def test_the_hermes_installer_is_fetched_at_the_pinned_commit() -> None:
+    """Pinning the agent but running main's installer reintroduces the same drift."""
+    sha = "3c27eb6234bf91b8ceee9e9071591b31e9b148cb"
+    pins = {
+        "CLAUDE_CODE_VERSION": "1",
+        "CODEX_VERSION": "2",
+        "OPENCODE_VERSION": "3",
+        "PI_VERSION": "5",
+        "NODE_VERSION": "4",
+        "HERMES_VERSION": sha,
+    }
+
+    layer = _load_generator_module()._install_layer(pins)
+
+    assert f"hermes-agent/{sha}/scripts/install.sh" in layer
+    assert "hermes-agent/main/" not in layer
+
+
+def test_the_hermes_pin_is_applied_by_commit_and_forced() -> None:
+    """`--branch` reaches `git clone --branch`, which rejects a SHA outright.
+
+    `--force-commit` is what makes the pin take effect. Without it the installer skips
+    the checkout whenever the commit is an ancestor of the freshly cloned HEAD, warns,
+    and leaves the image on the tip of main — the drift the pin exists to prevent,
+    arriving as a warning rather than a build failure.
+    """
+    sha = "3c27eb6234bf91b8ceee9e9071591b31e9b148cb"
+    pins = {
+        "CLAUDE_CODE_VERSION": "1",
+        "CODEX_VERSION": "2",
+        "OPENCODE_VERSION": "3",
+        "PI_VERSION": "5",
+        "NODE_VERSION": "4",
+        "HERMES_VERSION": sha,
+    }
+
+    layer = _load_generator_module()._install_layer(pins)
+
+    assert f"--commit {sha}" in layer
+    assert "--force-commit" in layer
+    assert "--branch" not in layer
+
+
+def test_the_alpine_branch_installs_the_shell_the_installer_needs() -> None:
+    """The installer is piped into bash, which Alpine does not ship by default."""
+    pins = {
+        "CLAUDE_CODE_VERSION": "1",
+        "CODEX_VERSION": "2",
+        "OPENCODE_VERSION": "3",
+        "PI_VERSION": "5",
+        "NODE_VERSION": "4",
+        "HERMES_VERSION": "3c27eb6234bf91b8ceee9e9071591b31e9b148cb",
+    }
+
+    layer = _load_generator_module()._install_layer(pins)
+
+    assert "apk add --no-cache bash git ripgrep xz" in layer
+
+
+def test_a_missing_hermes_pin_is_reported_with_the_other_pins(tmp_path: Path) -> None:
+    """Absent, it must fail the shared pin check rather than crash reading the layer."""
+    module = _load_generator_module()
+    versions = tmp_path / "agent-versions.env"
+    versions.write_text(
+        "CLAUDE_CODE_VERSION=1\nCODEX_VERSION=2\nOPENCODE_VERSION=3\nPI_VERSION=5\nNODE_VERSION=4\n"
+    )
+    module.AGENT_VERSIONS_FILE = versions
+    source = tmp_path / "source"
+    _write_task(source, "task-a", "[environment]\n", "FROM ubuntu:22.04\n")
+
+    with pytest.raises(ValueError, match="missing pins.*HERMES_VERSION"):
+        module.prepare_dataset(
+            source_dataset="openthoughts-tblite@2.0",
+            source_dir=source,
+            output_dir=tmp_path / "prepared",
+            harbor_command="harbor",
+            overwrite=False,
+        )
+

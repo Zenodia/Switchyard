@@ -4,6 +4,7 @@ on:
   push:
     tags:
       - "v*.*.*"
+      - "!v*-*"
   workflow_dispatch:
     inputs:
       build_dev_artifact:
@@ -58,13 +59,24 @@ jobs:
 
           with open("pyproject.toml", "rb") as file:
               pyproject = tomllib.load(file)
+          with open("Cargo.toml", "rb") as file:
+              cargo = tomllib.load(file)
+
           package_version = pyproject["project"]["version"]
+          workspace_version = cargo["workspace"]["package"]["version"]
+          if workspace_version != package_version:
+              raise SystemExit(
+                  "Python package version "
+                  f"{package_version!r} does not match Rust workspace version "
+                  f"{workspace_version!r}"
+              )
+
           expected = f"v{package_version}"
           if tag != expected:
               raise SystemExit(
                   f"release tag {tag!r} does not match pyproject version {package_version!r}"
               )
-          print(f"release tag {tag} matches pyproject version {package_version}")
+          print(f"release tag {tag} matches Python and Rust version {package_version}")
           PY
 
   python-release-checks:
@@ -121,9 +133,7 @@ jobs:
       - name: Stamp dev source distribution metadata
         if: ${{ github.event_name == 'workflow_dispatch' && inputs.build_dev_matrix }}
         run: |
-          python scripts/release/set_dev_wheel_version.py \
-            "${{ inputs.dev_version }}" \
-            --package-name "${DEV_PACKAGE_NAME}"
+          python scripts/release/set_dev_wheel_version.py "${{ inputs.dev_version }}"
       - name: Build sdist
         run: uv run maturin sdist --out dist
       - name: Verify sdist license files
@@ -147,6 +157,13 @@ jobs:
 
           print(f"{archives[0]} contains {', '.join(sorted(expected_suffixes))}")
           PY
+      - name: Smoke install source distribution
+        working-directory: /tmp
+        run: |
+          sdist="$(find "${GITHUB_WORKSPACE}/dist" -maxdepth 1 -name '*.tar.gz' -print -quit)"
+          uv run --isolated --no-project --python 3.12 \
+            --with "${sdist}" \
+            python -c "from switchyard_rust import _switchyard_rust; print('sdist install OK:', _switchyard_rust.__name__)"
       - uses: actions/upload-artifact@v4
         with:
           name: nemo-switchyard-sdist
@@ -196,9 +213,7 @@ jobs:
         if: ${{ github.event_name == 'workflow_dispatch' && inputs.build_dev_matrix }}
         shell: bash
         run: |
-          python scripts/release/set_dev_wheel_version.py \
-            "${{ inputs.dev_version }}" \
-            --package-name "${DEV_PACKAGE_NAME}"
+          python scripts/release/set_dev_wheel_version.py "${{ inputs.dev_version }}"
       - name: Setup QEMU for Linux cross builds
         if: runner.os == 'Linux' && runner.arch != 'ARM64' && matrix.manylinux_arch == 'aarch64'
         uses: docker/setup-qemu-action@v3
@@ -264,10 +279,12 @@ jobs:
           import switchyard
           import switchyard_rust
           from switchyard_rust import _switchyard_rust
+          from switchyard_rust.server import Server
 
           print("switchyard", switchyard.__version__)
           print("switchyard_rust", switchyard_rust.__file__)
           print("rust extension", _switchyard_rust.__name__)
+          print("server", Server)
           PY
       - uses: actions/setup-python@v5
         if: ${{ matrix.smoke }}
@@ -291,10 +308,12 @@ jobs:
           import switchyard
           import switchyard_rust
           from switchyard_rust import _switchyard_rust
+          from switchyard_rust.server import Server
 
           print("switchyard", switchyard.__version__)
           print("switchyard_rust", switchyard_rust.__file__)
           print("rust extension", _switchyard_rust.__name__)
+          print("server", Server)
           PY
       - uses: actions/upload-artifact@v4
         with:
@@ -313,9 +332,7 @@ jobs:
       - name: Stamp dev wheel metadata
         shell: bash
         run: |
-          python scripts/release/set_dev_wheel_version.py \
-            "${{ inputs.dev_version }}" \
-            --package-name "${DEV_PACKAGE_NAME}"
+          python scripts/release/set_dev_wheel_version.py "${{ inputs.dev_version }}"
       - name: Build manylinux x86_64 wheel
         shell: bash
         run: |
@@ -422,7 +439,7 @@ jobs:
   publish:
     name: Publish distributions
     if: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v') }}
-    needs: [source-dist, wheels]
+    needs: [source-dist, wheels, publish-rust-crates]
     runs-on: ubuntu-latest
     environment: pypi
     permissions:
@@ -439,7 +456,76 @@ jobs:
         run: ls -l dist
 
       - name: Publish to PyPI
-        run: uv publish --trusted-publishing always dist/*
+        run: |
+          uv publish \
+            --trusted-publishing always \
+            --check-url https://pypi.org/simple/ \
+            dist/*
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
+
+  publish-rust-crates:
+    name: Publish Rust crates
+    if: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v') }}
+    needs: [source-dist, wheels]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Publish crates in dependency order
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          metadata="$(cargo metadata --locked --no-deps --format-version 1)"
+
+          for crate in \
+            switchyard-protocol \
+            switchyard-translation \
+            switchyard-libsy \
+            switchyard-llm-client \
+            prefill-router \
+            switchyard-runner \
+            switchyard-server; do
+            crate_version="$(jq -r --arg crate "${crate}" \
+              '.packages[] | select(.name == $crate) | .version' <<<"${metadata}")"
+            if [[ "${crate_version}" != "${version}" ]]; then
+              echo "Release tag ${version} does not match ${crate} ${crate_version}" >&2
+              exit 1
+            fi
+          done
+
+          wait_for_crate() {
+            local crate="$1"
+            for attempt in {1..30}; do
+              if cargo info --registry crates-io "${crate}@${version}" >/dev/null 2>&1; then
+                return 0
+              fi
+              echo "Waiting for ${crate} ${version} (${attempt}/30)"
+              sleep 10
+            done
+            echo "${crate} ${version} did not reach the crates.io index" >&2
+            return 1
+          }
+
+          publish_crate() {
+            local crate="$1"
+            if cargo info --registry crates-io "${crate}@${version}" >/dev/null 2>&1; then
+              echo "${crate} ${version} already exists; skipping"
+              return 0
+            fi
+            cargo publish --locked --package "${crate}"
+            wait_for_crate "${crate}"
+          }
+
+          publish_crate switchyard-protocol
+          publish_crate switchyard-translation
+          publish_crate switchyard-libsy
+          publish_crate switchyard-llm-client
+          publish_crate prefill-router
+          publish_crate switchyard-runner
+          publish_crate switchyard-server

@@ -3,8 +3,6 @@
 
 """Prepare a local closed-book Harbor dataset with prebaked coding agents."""
 
-from __future__ import annotations
-
 import argparse
 import hashlib
 import json
@@ -13,15 +11,21 @@ import re
 import shlex
 import shutil
 import subprocess
-import tomllib
-from datetime import UTC, datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+
+try:
+    import tomllib
+except ModuleNotFoundError:  # Python 3.10
+    import tomli as tomllib
 
 try:
     import yaml
 except ImportError:  # pragma: no cover - exercised only in a broken environment
     yaml = None
+
+UTC = timezone.utc
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 DEFAULT_SOURCE_DATASET = "openthoughts-tblite@2.0"
@@ -29,7 +33,11 @@ DEFAULT_OUTPUT_DIR = SCRIPT_DIR / "datasets" / "openthoughts-tblite-closed-book"
 AGENT_VERSIONS_FILE = SCRIPT_DIR / "agent-versions.env"
 PROXY_ASSET_DIR = SCRIPT_DIR / "closed_book_proxy" / "proxy"
 AGENT_ENTRYPOINT = "switchyard-agent-entrypoint.sh"
+COMMIT_SHA_PATTERN = re.compile(r"[0-9a-f]{40}")
 TERMINAL_BENCH_2_SOURCE_DATASET = "terminal-bench/terminal-bench-2"
+TERMINAL_BENCH_2_1_SOURCE_DATASET = "terminal-bench/terminal-bench-2-1"
+# Shared across the TB2 family (2.0 + the 2.1 verified iteration): 2.1 tweaks
+# timeouts/resources on existing tasks, so its Oracle solutions reach the same hosts.
 TERMINAL_BENCH_2_PROXY_ALLOWLIST_HOSTS = (
     "api.github.com",
     "api.launchpad.net",
@@ -84,20 +92,26 @@ def _read_env_file(path: Path) -> dict[str, str]:
     return values
 
 
+def _file_digest(path: Path) -> bytes:
+    hasher = hashlib.sha256()
+    with path.open("rb") as file:
+        for chunk in iter(lambda: file.read(1024 * 1024), b""):
+            hasher.update(chunk)
+    return hasher.digest()
+
+
 def _path_digest(path: Path) -> str:
     try:
         resolved = path.resolve()
         hasher = hashlib.sha256()
         if resolved.is_file():
             hasher.update(resolved.name.encode())
-            with resolved.open("rb") as fh:
-                hasher.update(hashlib.file_digest(fh, "sha256").digest())
+            hasher.update(_file_digest(resolved))
             return f"sha256:{hasher.hexdigest()}"
         if resolved.is_dir():
             for item in sorted(p for p in resolved.rglob("*") if p.is_file()):
                 rel = item.relative_to(resolved).as_posix()
-                with item.open("rb") as fh:
-                    file_hash = hashlib.file_digest(fh, "sha256").hexdigest()
+                file_hash = _file_digest(item).hex()
                 hasher.update(f"{rel}\n{file_hash}\n".encode())
             return f"sha256:{hasher.hexdigest()}"
     except OSError:
@@ -128,7 +142,7 @@ def _exported_dataset_candidates(download_root: Path, source_dataset: str) -> li
 
 def _proxy_allowlist_hosts_for_dataset(source_dataset: str) -> tuple[str, ...]:
     source_name = source_dataset.split("@", 1)[0]
-    if source_name == TERMINAL_BENCH_2_SOURCE_DATASET:
+    if source_name in (TERMINAL_BENCH_2_SOURCE_DATASET, TERMINAL_BENCH_2_1_SOURCE_DATASET):
         return TERMINAL_BENCH_2_PROXY_ALLOWLIST_HOSTS
     return ()
 
@@ -184,10 +198,36 @@ def _install_layer(pins: dict[str, str]) -> str:
     claude_version = pins["CLAUDE_CODE_VERSION"]
     codex_version = pins["CODEX_VERSION"]
     opencode_version = pins["OPENCODE_VERSION"]
+    pi_version = pins["PI_VERSION"]
+    # Hermes (NousResearch hermes-agent) is a per-user uv app installed from
+    # GitHub, not an npm package. Baking it here (build-time, with host network)
+    # means the runtime install() skip-guard short-circuits, so tasks need no
+    # egress for it — enabling closed-book Hermes runs.
+    #
+    # HERMES_VERSION must be a full commit SHA. A tag is not enough: tags can be
+    # deleted or repointed, so two builds could record the same version string while
+    # installing different code — the manifest would assert a reproducibility it does
+    # not have. Requiring one shape is complete by construction, where a deny-list of
+    # moving names ("main", "master", ...) can never be, since any branch name passes.
+    # The installer script is fetched from the same commit for the same reason: pinning
+    # the agent but running whatever installer main has today reintroduces the drift.
+    #
+    # The pin is applied with the installer's --commit, not --branch: --branch reaches
+    # `git clone --branch`, which accepts only branch and tag names and rejects a SHA.
+    # --force-commit is required with it. Without it the installer skips the pin when
+    # the commit is an ancestor of the freshly cloned HEAD, logging a warning and
+    # silently leaving the image on the tip of main — the drift this pin exists to
+    # prevent, arriving as a warning rather than a build failure.
+    hermes_version = pins["HERMES_VERSION"]
+    if not COMMIT_SHA_PATTERN.fullmatch(hermes_version):
+        raise SystemExit(
+            f"HERMES_VERSION={hermes_version!r} is not a full 40-character commit SHA; "
+            "a tag or branch can be repointed and cannot be recorded as a reproducible pin"
+        )
     return f"""
 
 # Switchyard benchmark prebaked coding agents.
-ENV SWITCHYARD_PREBAKED_AGENT_VERSIONS="claude-code={claude_version},codex={codex_version},opencode={opencode_version},node={node_version}"
+ENV SWITCHYARD_PREBAKED_AGENT_VERSIONS="claude-code={claude_version},codex={codex_version},opencode={opencode_version},pi={pi_version},node={node_version},hermes={hermes_version}"
 RUN set -eux; \\
     if command -v apt-get >/dev/null 2>&1; then \\
         apt-get update; \\
@@ -224,10 +264,25 @@ RUN set -eux; \\
     npm install -g \\
         "@anthropic-ai/claude-code@{claude_version}" \\
         "@openai/codex@{codex_version}" \\
-        "opencode-ai@{opencode_version}"; \\
+        "opencode-ai@{opencode_version}" \\
+        "@earendil-works/pi-coding-agent@{pi_version}"; \\
     claude --version; \\
     codex --version; \\
-    opencode --version
+    opencode --version; \\
+    pi --version
+RUN set -eux; \\
+    export HOME=/root; \\
+    export PATH="/root/.local/bin:$PATH"; \\
+    if command -v apt-get >/dev/null 2>&1; then \\
+        apt-get update; \\
+        apt-get install -y --no-install-recommends git ripgrep xz-utils; \\
+        rm -rf /var/lib/apt/lists/*; \\
+    elif command -v apk >/dev/null 2>&1; then \\
+        apk add --no-cache bash git ripgrep xz; \\
+    fi; \\
+    curl -fsSL https://raw.githubusercontent.com/NousResearch/hermes-agent/{hermes_version}/scripts/install.sh \\
+        | bash -s -- --skip-setup --commit {hermes_version} --force-commit; \\
+    hermes version
 """
 
 
@@ -408,6 +463,8 @@ def _merge_compose(task_dir: Path, proxy_allowlist_hosts: tuple[str, ...]) -> di
             "CLOSED_BOOK_MODE=${CLOSED_BOOK_MODE:-1}",
             "OPENAI_BASE_URL=${OPENAI_BASE_URL:-}",
             "SWITCHYARD_BASE_URL=${SWITCHYARD_BASE_URL:-}",
+            f"SWITCHYARD_TASK_ID={task_dir.name}",
+            "SWITCHYARD_TRIAL_DIR=${HOST_AGENT_LOGS_PATH:-}",
             "VERIFIER_PROXY_TOKEN=${SWITCHYARD_VERIFIER_PROXY_TOKEN:-}",
         ],
         "healthcheck": {
@@ -450,15 +507,26 @@ def _merge_compose(task_dir: Path, proxy_allowlist_hosts: tuple[str, ...]) -> di
 
 
 def prepare_dataset(
-    *,
     source_dataset: str,
     source_dir: Path | None,
     output_dir: Path,
     harbor_command: str,
     overwrite: bool,
 ) -> Path:
+    """Copy a Harbor dataset to `output_dir` and bake the pinned agents into its task images.
+
+    Every agent pin in `benchmark/agent-versions.env` must be present; a missing pin raises
+    `ValueError` before any download or copy starts.
+    """
     pins = _read_env_file(AGENT_VERSIONS_FILE)
-    required = {"CLAUDE_CODE_VERSION", "CODEX_VERSION", "OPENCODE_VERSION", "NODE_VERSION"}
+    required = {
+        "CLAUDE_CODE_VERSION",
+        "CODEX_VERSION",
+        "HERMES_VERSION",
+        "NODE_VERSION",
+        "OPENCODE_VERSION",
+        "PI_VERSION",
+    }
     missing = sorted(required - pins.keys())
     if missing:
         raise ValueError(f"missing pins in {AGENT_VERSIONS_FILE}: {', '.join(missing)}")

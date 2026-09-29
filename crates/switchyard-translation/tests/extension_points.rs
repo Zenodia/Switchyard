@@ -4,7 +4,7 @@
 //! Tests for custom translation and stream codec extension points.
 
 use pretty_assertions::assert_eq;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use switchyard_translation::codecs::{
     DecodedRequest, DecodedResponse, EncodedRequest, EncodedResponse, FormatCodec,
 };
@@ -13,10 +13,10 @@ use switchyard_translation::util::{
     exact_preserved_response,
 };
 use switchyard_translation::{
-    ConversationRequest, ConversationResponse, ConversationStreamEvent, FormatId, FormatRegistry,
-    LossyConversionPolicy, Message, PreservationPolicy, ResponseOutput, Role, StreamCodec,
-    StreamCodecRegistry, StreamTranslationState, TargetCapabilities, TranslationEngine,
-    TranslationPolicy, Usage, WireFormat,
+    AggLlmResponse, FormatId, FormatRegistry, LlmRequest, LlmResponseChunk, LossyConversionPolicy,
+    Message, PreservationPolicy, ResponseOutput, Role, StreamCodec, StreamCodecRegistry,
+    StreamTranslationState, TargetCapabilities, TranslationEngine, TranslationPolicy, Usage,
+    WireFormat,
 };
 
 type TestResult = std::result::Result<(), Box<dyn std::error::Error + Send + Sync>>;
@@ -86,6 +86,26 @@ fn custom_stream_codec_can_participate_in_registered_stream_translation() -> Tes
     Ok(())
 }
 
+#[test]
+fn custom_stream_codec_replays_preserved_same_format_event() -> TestResult {
+    let mut registry = StreamCodecRegistry::new();
+    registry.register(CustomStreamCodec);
+    let engine = TranslationEngine::with_registries(FormatRegistry::new(), registry);
+    let format = FormatId::new("custom_stream");
+    let mut state = StreamTranslationState::new(format.clone(), format.clone());
+    let event = json!({
+        "kind": "delta",
+        "text": "hello",
+        "vendor_only": {"must": "survive"}
+    });
+
+    let preserved = engine.decode_stream_event(&mut state, format.clone(), event.clone())?;
+    let replayed = engine.encode_stream_event(&mut state, format, preserved)?;
+
+    assert_eq!(replayed, vec![event]);
+    Ok(())
+}
+
 // Verifies target capability policy can reject unsupported request features.
 #[test]
 fn capability_profile_can_fail_fast_when_target_cannot_accept_request_features() {
@@ -114,9 +134,11 @@ fn capability_profile_can_fail_fast_when_target_cannot_accept_request_features()
         Err(error) => error,
     };
 
-    assert!(error
-        .to_string()
-        .contains("target format/profile does not support tools"));
+    assert!(
+        error
+            .to_string()
+            .contains("target format/profile does not support tools")
+    );
 }
 
 // Minimal custom buffered codec used to exercise the registry extension point.
@@ -133,7 +155,7 @@ impl FormatCodec for MinimalCustomCodec {
         policy: &TranslationPolicy,
     ) -> switchyard_translation::Result<DecodedRequest> {
         Ok(DecodedRequest {
-            request: ConversationRequest {
+            request: LlmRequest {
                 model: body
                     .get("model")
                     .and_then(Value::as_str)
@@ -145,7 +167,7 @@ impl FormatCodec for MinimalCustomCodec {
                         .unwrap_or_default(),
                 )],
                 preservation: capture_request_preservation(self.format(), body, policy),
-                ..ConversationRequest::default()
+                ..LlmRequest::default()
             },
             diagnostics: Vec::new(),
         })
@@ -153,7 +175,7 @@ impl FormatCodec for MinimalCustomCodec {
 
     fn encode_request(
         &self,
-        request: &ConversationRequest,
+        request: &LlmRequest,
         policy: &TranslationPolicy,
     ) -> switchyard_translation::Result<EncodedRequest> {
         if let Some(body) = exact_preserved_request(&request.preservation, self.format(), policy) {
@@ -181,7 +203,7 @@ impl FormatCodec for MinimalCustomCodec {
         policy: &TranslationPolicy,
     ) -> switchyard_translation::Result<DecodedResponse> {
         Ok(DecodedResponse {
-            response: ConversationResponse {
+            response: AggLlmResponse {
                 id: body
                     .get("id")
                     .and_then(Value::as_str)
@@ -191,6 +213,7 @@ impl FormatCodec for MinimalCustomCodec {
                     .and_then(Value::as_str)
                     .map(ToOwned::to_owned),
                 outputs: vec![ResponseOutput {
+                    url_citations: Vec::new(),
                     role: Role::Assistant,
                     content: vec![switchyard_translation::ContentBlock::Text {
                         text: body
@@ -203,7 +226,7 @@ impl FormatCodec for MinimalCustomCodec {
                 }],
                 usage: Usage::default(),
                 preservation: capture_response_preservation(self.format(), body, policy),
-                ..ConversationResponse::default()
+                ..AggLlmResponse::default()
             },
             diagnostics: Vec::new(),
         })
@@ -211,7 +234,7 @@ impl FormatCodec for MinimalCustomCodec {
 
     fn encode_response(
         &self,
-        response: &ConversationResponse,
+        response: &AggLlmResponse,
         policy: &TranslationPolicy,
     ) -> switchyard_translation::Result<EncodedResponse> {
         if let Some(body) = exact_preserved_response(&response.preservation, self.format(), policy)
@@ -254,9 +277,9 @@ impl StreamCodec for CustomStreamCodec {
         &self,
         _state: &mut StreamTranslationState,
         event: &Value,
-    ) -> Vec<ConversationStreamEvent> {
+    ) -> Vec<LlmResponseChunk> {
         match event.get("kind").and_then(Value::as_str) {
-            Some("start") => vec![ConversationStreamEvent::MessageStart {
+            Some("start") => vec![LlmResponseChunk::MessageStart {
                 id: event
                     .get("id")
                     .and_then(Value::as_str)
@@ -270,7 +293,7 @@ impl StreamCodec for CustomStreamCodec {
                 .get("text")
                 .and_then(Value::as_str)
                 .map(|text| {
-                    vec![ConversationStreamEvent::TextDelta {
+                    vec![LlmResponseChunk::TextDelta {
                         index: 0,
                         text: text.to_string(),
                     }]
@@ -283,10 +306,10 @@ impl StreamCodec for CustomStreamCodec {
     fn encode_event(
         &self,
         _state: &mut StreamTranslationState,
-        event: ConversationStreamEvent,
+        event: LlmResponseChunk,
     ) -> Vec<Value> {
         match event {
-            ConversationStreamEvent::TextDelta { text, .. } => {
+            LlmResponseChunk::TextDelta { text, .. } => {
                 vec![json!({"kind": "delta", "text": text})]
             }
             _ => Vec::new(),
